@@ -814,6 +814,66 @@ class TabletButtonSize {
   static const double gridGap = 12.0;
 }
 
+// ==================== 安全与密码授权服务 ====================
+
+class AuthService {
+  static const String _kLastAuthKey = 'auth_last_verified_timestamp';
+  static const String appPassword = '0818';
+  static const int authValidityDays = 30;
+
+  /// 检查当前授权是否在 30 天有效期内
+  static Future<bool> isAuthValid() async {
+    final prefs = await SharedPreferences.getInstance();
+    final lastTime = prefs.getInt(_kLastAuthKey);
+    if (lastTime == null) {
+      // 首次登入，未曾验证
+      return false;
+    }
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final diffMillis = now - lastTime;
+    final validMillis = authValidityDays * 24 * 60 * 60 * 1000;
+
+    // 如果超过 30 天或时间被回拨异常，则需要重新验证
+    if (diffMillis < 0 || diffMillis >= validMillis) {
+      return false;
+    }
+    return true;
+  }
+
+  /// 校验密码并更新验证时间戳
+  static Future<bool> verifyAndSave(String inputPassword) async {
+    if (inputPassword.trim() == appPassword) {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setInt(_kLastAuthKey, DateTime.now().millisecondsSinceEpoch);
+      return true;
+    }
+    return false;
+  }
+
+  /// 获取上次验证时间
+  static Future<DateTime?> getLastAuthTime() async {
+    final prefs = await SharedPreferences.getInstance();
+    final lastTime = prefs.getInt(_kLastAuthKey);
+    if (lastTime == null) return null;
+    return DateTime.fromMillisecondsSinceEpoch(lastTime);
+  }
+
+  /// 获取距离下次验证剩余天数
+  static Future<int> getRemainingDays() async {
+    final last = await getLastAuthTime();
+    if (last == null) return 0;
+    final nextDue = last.add(const Duration(days: authValidityDays));
+    final diff = nextDue.difference(DateTime.now()).inDays;
+    return diff < 0 ? 0 : diff;
+  }
+
+  /// 重置授权（用于测试或重新锁屏）
+  static Future<void> resetAuth() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove(_kLastAuthKey);
+  }
+}
+
 // ==================== 主应用 ====================
 
 void main() {
@@ -840,7 +900,216 @@ class MyApp extends StatelessWidget {
           style: ElevatedButton.styleFrom(minimumSize: const Size(48, 48)),
         ),
       ),
-      home: const MainScreen(),
+      home: const AuthGate(),
+    );
+  }
+}
+
+/// 授权门控组件：监控 30 天授权状态与应用前台恢复
+class AuthGate extends StatefulWidget {
+  const AuthGate({super.key});
+
+  @override
+  State<AuthGate> createState() => _AuthGateState();
+}
+
+class _AuthGateState extends State<AuthGate> with WidgetsBindingObserver {
+  bool _isLoading = true;
+  bool _isAuthenticated = false;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _checkAuth();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _checkAuth();
+    }
+  }
+
+  Future<void> _checkAuth() async {
+    final valid = await AuthService.isAuthValid();
+    if (mounted) {
+      setState(() {
+        _isAuthenticated = valid;
+        _isLoading = false;
+      });
+    }
+  }
+
+  void _onUnlockSuccess() {
+    setState(() {
+      _isAuthenticated = true;
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_isLoading) {
+      return const Scaffold(
+        body: Center(child: CircularProgressIndicator()),
+      );
+    }
+
+    if (_isAuthenticated) {
+      return const MainScreen();
+    }
+
+    return PasswordLockScreen(onSuccess: _onUnlockSuccess);
+  }
+}
+
+/// 密码输入锁定页面
+class PasswordLockScreen extends StatefulWidget {
+  final VoidCallback onSuccess;
+  const PasswordLockScreen({super.key, required this.onSuccess});
+
+  @override
+  State<PasswordLockScreen> createState() => _PasswordLockScreenState();
+}
+
+class _PasswordLockScreenState extends State<PasswordLockScreen> {
+  final TextEditingController _pwdCtrl = TextEditingController();
+  bool _obscureText = true;
+  String? _errorMsg;
+  bool _isChecking = false;
+
+  @override
+  void dispose() {
+    _pwdCtrl.dispose();
+    super.dispose();
+  }
+
+  Future<void> _submit() async {
+    final input = _pwdCtrl.text.trim();
+    if (input.isEmpty) {
+      setState(() => _errorMsg = '请输入密码');
+      return;
+    }
+
+    setState(() {
+      _isChecking = true;
+      _errorMsg = null;
+    });
+
+    final success = await AuthService.verifyAndSave(input);
+
+    if (!mounted) return;
+
+    if (success) {
+      setState(() => _isChecking = false);
+      widget.onSuccess();
+    } else {
+      setState(() {
+        _isChecking = false;
+        _errorMsg = '密码错误，请重新输入';
+      });
+      _pwdCtrl.clear();
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+
+    return Scaffold(
+      backgroundColor: Colors.blueGrey[50],
+      body: SafeArea(
+        child: Center(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.symmetric(horizontal: 28.0, vertical: 24.0),
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 420),
+              child: Card(
+                elevation: 4,
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+                child: Padding(
+                  padding: const EdgeInsets.all(28.0),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Container(
+                        width: 72,
+                        height: 72,
+                        decoration: BoxDecoration(
+                          color: theme.colorScheme.primaryContainer,
+                          shape: BoxShape.circle,
+                        ),
+                        child: Icon(
+                          Icons.lock_outline_rounded,
+                          size: 38,
+                          color: theme.colorScheme.onPrimaryContainer,
+                        ),
+                      ),
+                      const SizedBox(height: 20),
+                      const Text(
+                        '软件安全验证',
+                        style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
+                      ),
+                      const SizedBox(height: 8),
+                      Text(
+                        '首次登入或每 30 天需验证一次密码\n请输入密码以继续使用软件',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(fontSize: 14, color: Colors.grey[700], height: 1.4),
+                      ),
+                      const SizedBox(height: 28),
+                      TextField(
+                        controller: _pwdCtrl,
+                        obscureText: _obscureText,
+                        keyboardType: TextInputType.number,
+                        textInputAction: TextInputAction.done,
+                        onSubmitted: (_) => _submit(),
+                        style: const TextStyle(fontSize: 20, letterSpacing: 4),
+                        textAlign: TextAlign.center,
+                        decoration: InputDecoration(
+                          hintText: '请输入4位密码',
+                          hintStyle: const TextStyle(letterSpacing: 0, fontSize: 16),
+                          prefixIcon: const Icon(Icons.password_rounded),
+                          suffixIcon: IconButton(
+                            icon: Icon(_obscureText ? Icons.visibility_off : Icons.visibility),
+                            onPressed: () => setState(() => _obscureText = !_obscureText),
+                          ),
+                          errorText: _errorMsg,
+                        ),
+                      ),
+                      const SizedBox(height: 24),
+                      SizedBox(
+                        width: double.infinity,
+                        height: 50,
+                        child: ElevatedButton(
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: theme.colorScheme.primary,
+                            foregroundColor: Colors.white,
+                            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                          ),
+                          onPressed: _isChecking ? null : _submit,
+                          child: _isChecking
+                              ? const SizedBox(
+                                  width: 22,
+                                  height: 22,
+                                  child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2.5),
+                                )
+                              : const Text('验证并解锁', style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold)),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
     );
   }
 }
@@ -2391,6 +2660,7 @@ class _SettingsPageState extends State<SettingsPage> {
   bool _tabletMode = false; // 平板模式开关
   List<String> _logs = []; // 打印调试日志
   String _qrBase64 = ''; // 付款二维码 base64 PNG
+  int _remainingDays = 30; // 授权剩余天数
 
   String get _currency => _currencyCtrl.text.trim().isEmpty ? 'RM' : _currencyCtrl.text.trim();
 
@@ -2404,6 +2674,7 @@ class _SettingsPageState extends State<SettingsPage> {
     final menu = await SettingsStore.loadMenu();
     final next = await SettingsStore.getCurrentNo();
     final start = await SettingsStore.getStartNo();
+    final days = await AuthService.getRemainingDays();
     _storeNameCtrl.text = await SettingsStore.getStoreName();
     _subtitle1Ctrl.text = await SettingsStore.getSubtitle1();
     _subtitle2Ctrl.text = await SettingsStore.getSubtitle2();
@@ -2428,6 +2699,7 @@ class _SettingsPageState extends State<SettingsPage> {
         _menu = menu;
         _nextNo = next;
         _startNoCtrl.text = '$start';
+        _remainingDays = days;
       });
     }
   }
@@ -2676,6 +2948,82 @@ class _SettingsPageState extends State<SettingsPage> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
+            // ===== 软件安全与授权 =====
+            const Text('软件授权与安全', style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 8),
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(16.0),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        const Icon(Icons.verified_user_outlined, color: Colors.green, size: 24),
+                        const SizedBox(width: 8),
+                        const Text('授权状态：正常激活',
+                            style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+                        const Spacer(),
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                          decoration: BoxDecoration(
+                            color: Colors.green[50],
+                            borderRadius: BorderRadius.circular(8),
+                            border: Border.all(color: Colors.green.shade300),
+                          ),
+                          child: Text(
+                            '剩余 $_remainingDays 天',
+                            style: TextStyle(color: Colors.green[800], fontWeight: FontWeight.bold),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 10),
+                    const Text(
+                      '软件采用 30 天周期安全验证，首次及到期时需输入密码（0818）方可继续使用。',
+                      style: TextStyle(fontSize: 13, color: Colors.grey, height: 1.4),
+                    ),
+                    const SizedBox(height: 12),
+                    OutlinedButton.icon(
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: Colors.blueGrey[800],
+                        minimumSize: const Size(double.infinity, 42),
+                      ),
+                      onPressed: () async {
+                        final confirm = await showDialog<bool>(
+                          context: context,
+                          builder: (ctx) => AlertDialog(
+                            title: const Text('锁定软件'),
+                            content: const Text('锁定后将立即弹出密码输入界面，需要重新输入密码 0818 才能进入。确定锁定吗？'),
+                            actions: [
+                              TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('取消')),
+                              ElevatedButton(
+                                style: ElevatedButton.styleFrom(backgroundColor: Colors.blueGrey, foregroundColor: Colors.white),
+                                onPressed: () => Navigator.pop(ctx, true),
+                                child: const Text('确定锁定'),
+                              ),
+                            ],
+                          ),
+                        );
+                        if (confirm == true) {
+                          await AuthService.resetAuth();
+                          if (mounted) {
+                            Navigator.of(context).pushAndRemoveUntil(
+                              MaterialPageRoute(builder: (_) => const AuthGate()),
+                              (route) => false,
+                            );
+                          }
+                        }
+                      },
+                      icon: const Icon(Icons.lock_reset, size: 20),
+                      label: const Text('立即锁屏并测试密码'),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 16),
+
             // ===== 打印机纸张规格 =====
             const Text('打印机纸张规格', style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold)),
             const SizedBox(height: 8),
