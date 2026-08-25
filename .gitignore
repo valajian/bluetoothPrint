@@ -1,0 +1,49 @@
+# IDE & Editor files
+.idea/
+.vscode/
+*.iml
+*.ipr
+*.iws
+.androidide/
+.codewhale/
+.mimocode/
+
+# OS generated files
+.DS_Store
+Thumbs.db
+desktop.ini
+*.bak
+
+# Large driver installers
+USB-Driver-Install-1.0.3.0/
+*.exe
+*.dll
+
+# Flutter / Dart
+**/doc/api/
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+.pub-cache/
+.pub/
+**/build/
+
+# Android related
+**/android/**/gradle-wrapper.jar
+**/android/.gradle/
+**/android/captures/
+**/android/local.properties
+**/android/**/GeneratedPluginRegistrant.java
+
+# Build outputs & Binary APKs
+*.apk
+*.aab
+*.symbols
+*.map.json
+
+# Temporary logs & debug probe files
+*.log
+analyze_out.txt
+gradle_out.txt
+env_probe.txt

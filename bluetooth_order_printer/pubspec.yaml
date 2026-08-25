@@ -1,0 +1,25 @@
+name: bluetooth_order_printer
+description: 精臣B3蓝牙打印摆摊点单小票APP（经典SPP）
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+  flutter: '>=3.16.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+  shared_preferences: ^2.3.3
+  image_picker: ^1.1.2
+  image: ^4.3.0
+  fast_gbk: ^1.0.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+flutter:
+  uses-material-design: true
