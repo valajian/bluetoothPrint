@@ -28,14 +28,27 @@ const platform = MethodChannel('com.example.bluetooth_order_printer/bluetooth');
 class MenuItem {
   String name;
   double price;
-  MenuItem({required this.name, required this.price});
+  bool spicyEnabled; // 是否支持选择辣/不辣（在设置中勾选）
+
+  MenuItem({
+    required this.name,
+    required this.price,
+    this.spicyEnabled = false,
+  });
 }
 
 class OrderItem {
   String name;
   double price;
   int quantity;
-  OrderItem({required this.name, required this.price, required this.quantity});
+  bool isSpicy; // 是否加辣
+
+  OrderItem({
+    required this.name,
+    required this.price,
+    required this.quantity,
+    this.isSpicy = false,
+  });
 
   /// 小计 = 单价 × 数量，保留两位小数
   double get subtotal => (price * quantity * 100).roundToDouble() / 100;
@@ -276,7 +289,11 @@ class SettingsStore {
     for (final s in list) {
       try {
         final m = jsonDecode(s) as Map<String, dynamic>;
-        menu.add(MenuItem(name: m['n'] as String, price: (m['p'] as num).toDouble()));
+        menu.add(MenuItem(
+          name: m['n'] as String,
+          price: (m['p'] as num).toDouble(),
+          spicyEnabled: m['s'] as bool? ?? false,
+        ));
       } catch (_) {}
     }
     return menu;
@@ -284,8 +301,14 @@ class SettingsStore {
 
   static Future<void> saveMenu(List<MenuItem> menu) async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setStringList(_menuKey,
-        menu.map((m) => jsonEncode({'n': m.name, 'p': m.price})).toList());
+    await prefs.setStringList(
+      _menuKey,
+      menu.map((m) => jsonEncode({
+        'n': m.name,
+        'p': m.price,
+        's': m.spicyEnabled,
+      })).toList(),
+    );
   }
 
   // ---- 外卖单号 ----
@@ -340,7 +363,12 @@ String fmt(double v) => v.toStringAsFixed(2);
 String encodeOrder(Order o) => jsonEncode({
       'id': o.id,
       'no': o.orderNo,
-      'items': o.items.map((i) => {'n': i.name, 'p': i.price, 'q': i.quantity}).toList(),
+      'items': o.items.map((i) => {
+        'n': i.name,
+        'p': i.price,
+        'q': i.quantity,
+        's': i.isSpicy,
+      }).toList(),
       'total': o.total,
       'note': o.note,
       'time': o.time.toIso8601String(),
@@ -353,9 +381,11 @@ Order? decodeOrder(String json) {
     final items = itemsRaw.map((e) {
       final m = e as Map<String, dynamic>;
       return OrderItem(
-          name: m['n'] as String,
-          price: (m['p'] as num).toDouble(),
-          quantity: (m['q'] as num).toInt());
+        name: m['n'] as String,
+        price: (m['p'] as num).toDouble(),
+        quantity: (m['q'] as num).toInt(),
+        isSpicy: m['s'] as bool? ?? false,
+      );
     }).toList();
     return Order(
       id: map['id'] as String,
@@ -482,6 +512,29 @@ Future<ReceiptSettings> loadReceiptSettings() async {
   );
 }
 
+/// 24点阵 (18列 x 24行) 经典卡通小辣椒 🌶 ESC * 33 双密度位图指令
+final Uint8List _kChiliEscPosBytes = Uint8List.fromList([
+  0x1B, 0x2A, 33, 18, 0, // ESC * 33 nL=18, nH=0 (24-dot double density)
+  0x00, 0x00, 0x00, // col 0
+  0x00, 0x20, 0x00, // col 1
+  0x00, 0x30, 0x00, // col 2
+  0x00, 0x38, 0x00, // col 3
+  0x00, 0x3C, 0x00, // col 4
+  0x00, 0x7E, 0x00, // col 5
+  0x01, 0xFF, 0x00, // col 6
+  0x03, 0xFF, 0x80, // col 7
+  0x07, 0xFF, 0xC0, // col 8
+  0x0F, 0xFF, 0xE0, // col 9
+  0x1F, 0xFF, 0xF0, // col 10
+  0x3F, 0xFF, 0xF8, // col 11
+  0x7F, 0xFF, 0xFC, // col 12
+  0x7F, 0xFF, 0xFE, // col 13
+  0x6F, 0xFF, 0xFF, // col 14
+  0x47, 0xFF, 0xFE, // col 15
+  0x03, 0xFF, 0xF8, // col 16
+  0x00, 0xFE, 0x00, // col 17
+]);
+
 String buildEscPos(Order o, ReceiptSettings s) {
   final sb = StringBuffer();
   sb.write('\x1B\x40'); // ESC @ 初始化打印机（复位所有设置）
@@ -526,8 +579,6 @@ String buildEscPos(Order o, ReceiptSettings s) {
   }
 
   // ===== 商品表头（四列：名称左/数量居中/单价右/小计右）=====
-  // 50mm 列宽：名称 12 + 数量5 + 单价7 + 小计8 = 32 半角
-  // 80mm 列宽：名称 22 + 数量6 + 单价9 + 小计11 = 48 半角
   final nameW = is80mm ? 22 : 12;
   final qtyW = is80mm ? 6 : 5;
   final priceW = is80mm ? 9 : 7;
@@ -545,8 +596,9 @@ String buildEscPos(Order o, ReceiptSettings s) {
 
   // ===== 商品行（含数量+单价的小计金额；单价不带货币符号）=====
   for (final it in o.items) {
-    final name = cleanText(it.name);
-    final dn = _dispWidth(name) > nameW ? _truncateW(name, nameW) : name;
+    final rawName = cleanText(it.name);
+    final displayName = it.isSpicy ? '[辣]$rawName' : rawName;
+    final dn = _dispWidth(displayName) > nameW ? _truncateW(displayName, nameW) : displayName;
     sb.writeln(_padTo(dn, nameW) +
         _padCenter('${it.quantity}', qtyW) +
         _padTo(fmt(it.price), priceW, right: true) +
@@ -678,18 +730,147 @@ Uint8List? _pngToEscPosRasterBytes(String base64Str, {required String paperWidth
   }
 }
 
-/// 构建小票并生成 Byte 块列表（支持文本与 Raw Byte 位图混合）
+/// 构建小票并生成 Byte 块列表（支持文本、🌶 辣椒位图图标与 Raw Byte 位图混合）
 List<Uint8List> buildEscPosBytesChunks(Order o, ReceiptSettings s) {
   final chunks = <Uint8List>[];
+  final is80mm = s.paperWidth == '80mm';
+  final lineWidth = is80mm ? 48 : 32;
 
-  // 1. 小票文本主体内容
-  final textContent = buildEscPos(o, s);
-  final lines = _splitByLine(textContent);
-  for (final line in lines) {
-    chunks.add(Uint8List.fromList(gbk.encode(line)));
+  // ===== 1. 头部内容 =====
+  final sbHead = StringBuffer();
+  sbHead.write('\x1B\x40'); // ESC @ 初始化打印机
+
+  // 店铺标题
+  final title = cleanText(s.storeName.trim().isEmpty ? '美味小馆' : s.storeName.trim());
+  final titleMax = switch (s.titleFont) {
+    0 => is80mm ? 44 : 30,
+    3 => is80mm ? 12 : 8,
+    _ => is80mm ? 24 : 16,
+  };
+  final td = _dispWidth(title) > titleMax ? _truncateW(title, titleMax) : title;
+  sbHead.write('\x1B\x61\x01'); // 居中
+  sbHead.write('\x1D\x21');
+  sbHead.writeCharCode(_gsFonts[s.titleFont]);
+  sbHead.writeln('*$td*');
+  sbHead.write('\x1D\x21\x00');
+  sbHead.write('\x1B\x61\x00'); // 左对齐
+
+  // 副标题
+  final sub1 = cleanText(s.subtitle1.trim());
+  final sub2 = cleanText(s.subtitle2.trim());
+  if (sub1.isNotEmpty || sub2.isNotEmpty) {
+    sbHead.write('\x1B\x61\x01');
+    if (sub1.isNotEmpty) sbHead.writeln(_truncateW(sub1, lineWidth));
+    if (sub2.isNotEmpty) sbHead.writeln(_truncateW(sub2, lineWidth));
+    sbHead.write('\x1B\x61\x00');
   }
 
-  // 2. 付款二维码位图数据（单帧完整的 GS v 0 图像帧）
+  // 分隔线 + 时间
+  sbHead.writeln('-' * lineWidth);
+  sbHead.writeln('${s.timeLabel.trim().isEmpty ? '时间' : s.timeLabel.trim()}：${formatTime(o.time)}');
+  sbHead.writeln('-' * lineWidth);
+
+  // 正文字号
+  final useBodyFont = s.bodyFont != 0;
+  if (useBodyFont) {
+    sbHead.write('\x1D\x21');
+    sbHead.writeCharCode(_gsFonts[s.bodyFont]);
+  }
+
+  // 表头
+  final nameW = is80mm ? 22 : 12;
+  final qtyW = is80mm ? 6 : 5;
+  final priceW = is80mm ? 9 : 7;
+  final subtotalW = is80mm ? 11 : 8;
+
+  final dishLabel = s.dishLabel.trim().isEmpty ? '菜品' : s.dishLabel.trim();
+  final qtyLabel = s.qtyLabel.trim().isEmpty ? '数量' : s.qtyLabel.trim();
+  final priceLabel = s.priceLabel.trim().isEmpty ? '单价' : s.priceLabel.trim();
+  final subtotalLabel = s.subtotalLabel.trim().isEmpty ? '小计' : s.subtotalLabel.trim();
+  sbHead.writeln(_padTo(dishLabel, nameW) +
+      _padCenter(qtyLabel, qtyW) +
+      _padTo(priceLabel, priceW, right: true) +
+      _padTo(subtotalLabel, subtotalW, right: true));
+  sbHead.writeln('-' * lineWidth);
+
+  // 写入头部
+  for (final l in _splitByLine(sbHead.toString())) {
+    chunks.add(Uint8List.fromList(gbk.encode(l)));
+  }
+
+  // ===== 2. 商品行列表（精准支持 🌶 辣椒位图图标）=====
+  for (final it in o.items) {
+    final cleanName = cleanText(it.name);
+    if (it.isSpicy) {
+      // 辣椒图案占约 2 字符宽度，剩余宽度放菜品名
+      final availW = nameW > 2 ? nameW - 2 : nameW;
+      final dn = _dispWidth(cleanName) > availW ? _truncateW(cleanName, availW) : cleanName;
+      final paddedName = _padTo(dn, availW);
+
+      final rowBytes = <int>[];
+      // 插入 🌶 辣椒位图点阵
+      rowBytes.addAll(_kChiliEscPosBytes);
+      // 插入后续菜品名 + 数量 + 单价 + 小计 + 换行
+      final restStr = paddedName +
+          _padCenter('${it.quantity}', qtyW) +
+          _padTo(fmt(it.price), priceW, right: true) +
+          _padTo('${s.currency}${fmt(it.subtotal)}', subtotalW, right: true) +
+          '\n';
+      rowBytes.addAll(gbk.encode(restStr));
+      chunks.add(Uint8List.fromList(rowBytes));
+    } else {
+      final dn = _dispWidth(cleanName) > nameW ? _truncateW(cleanName, nameW) : cleanName;
+      final lineStr = _padTo(dn, nameW) +
+          _padCenter('${it.quantity}', qtyW) +
+          _padTo(fmt(it.price), priceW, right: true) +
+          _padTo('${s.currency}${fmt(it.subtotal)}', subtotalW, right: true) +
+          '\n';
+      chunks.add(Uint8List.fromList(gbk.encode(lineStr)));
+    }
+  }
+
+  // ===== 3. 尾部内容 =====
+  final sbFoot = StringBuffer();
+  sbFoot.writeln('-' * lineWidth);
+  final totalLabel = s.totalLabel.trim().isEmpty ? '合计金额' : s.totalLabel.trim();
+  sbFoot.writeln(_padTo('$totalLabel：${s.currency}${fmt(o.total)}', lineWidth, right: true));
+
+  if (o.note.isNotEmpty) {
+    sbFoot.writeln('备注：${cleanText(o.note)}');
+  }
+  if (useBodyFont) sbFoot.write('\x1D\x21\x00'); // 恢复字号
+  sbFoot.writeln('');
+
+  // 手机号与底部提示
+  sbFoot.write('\x1B\x61\x01'); // 居中
+  final phone = cleanText(s.phone.trim());
+  if (phone.isNotEmpty) {
+    sbFoot.writeln('手机号：$phone');
+  }
+  sbFoot.writeln(cleanText(
+      s.footerText.trim().isEmpty ? '谢谢惠顾，欢迎再次光临！' : s.footerText.trim()));
+  sbFoot.write('\x1B\x61\x00'); // 左对齐
+
+  // 单号大字
+  sbFoot.write('\x1B\x61\x01');
+  sbFoot.write('\x1D\x21');
+  sbFoot.writeCharCode(_gsFonts[s.orderNoFont]);
+  sbFoot.writeln('单号：${o.orderNo}');
+  sbFoot.write('\x1D\x21\x00');
+  sbFoot.write('\x1B\x61\x00');
+
+  if (s.qrBase64.isNotEmpty) {
+    sbFoot.writeln('');
+    sbFoot.write('\x1B\x61\x01');
+    sbFoot.writeln('QR Payment');
+    sbFoot.write('\x1B\x61\x00');
+  }
+
+  for (final l in _splitByLine(sbFoot.toString())) {
+    chunks.add(Uint8List.fromList(gbk.encode(l)));
+  }
+
+  // ===== 4. 付款二维码位图数据 =====
   if (s.qrBase64.isNotEmpty) {
     final qrBytes = _pngToEscPosRasterBytes(s.qrBase64, paperWidth: s.paperWidth);
     if (qrBytes != null && qrBytes.isNotEmpty) {
@@ -697,7 +878,7 @@ List<Uint8List> buildEscPosBytesChunks(Order o, ReceiptSettings s) {
     }
   }
 
-  // 3. 统一在最后走纸 5 行，便于撕纸，避免将走纸指令夹杂在文本与二维码之间
+  // ===== 5. 走纸 5 行 =====
   chunks.add(Uint8List.fromList(gbk.encode('\x1B\x64\x05')));
 
   return chunks;
@@ -2143,134 +2324,151 @@ class _OrderEntryPageState extends State<OrderEntryPage> {
   /// 平板菜单网格布局
   Widget _buildTabletMenuGrid(BuildContext context) {
     final s = _uiScale;
-    final width = MediaQuery.of(context).size.width;
-    final cols = (width / (220 * s)).floor().clamp(2, 6);
 
-    return Padding(
-      padding: EdgeInsets.all(16 * s),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          Text('选择菜品（点击添加/减少）',
-              style: TextStyle(fontSize: 18 * s, fontWeight: FontWeight.bold)),
-          SizedBox(height: 12 * s),
-          if (_menu.isEmpty)
-            Expanded(
-              child: Center(
-                child: Text('暂无菜单，请先在【设置】页添加菜品和价格',
-                    style: TextStyle(color: Colors.grey, fontSize: 16 * s)),
-              ),
-            )
-          else
-            Expanded(
-              child: GridView.builder(
-                gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-                  crossAxisCount: cols,
-                  childAspectRatio: 1.4,
-                  mainAxisSpacing: 12 * s,
-                  crossAxisSpacing: 12 * s,
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        // 用实际可用宽度计算列数，横屏左侧 flex=3 时只有 60% 宽度
+        final availWidth = constraints.maxWidth;
+        final cols = (availWidth / (200 * s)).floor().clamp(2, 4);
+
+        return Padding(
+          padding: EdgeInsets.all(14 * s),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Text('选择菜品（直接点击 + / - 加减）',
+                  style: TextStyle(fontSize: 16 * s, fontWeight: FontWeight.bold)),
+              SizedBox(height: 10 * s),
+              if (_menu.isEmpty)
+                Expanded(
+                  child: Center(
+                    child: Text('暂无菜单，请先在【设置】页添加菜品和价格',
+                        style: TextStyle(color: Colors.grey, fontSize: 16 * s)),
+                  ),
+                )
+              else
+                Expanded(
+                  child: GridView.builder(
+                    gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                      crossAxisCount: cols,
+                      // 让卡片足够高，名称清晰可见
+                      childAspectRatio: 0.88,
+                      mainAxisSpacing: 10 * s,
+                      crossAxisSpacing: 10 * s,
+                    ),
+                    itemCount: _menu.length,
+                    itemBuilder: (context, index) {
+                      final m = _menu[index];
+                      final qty = _qtyOf(m);
+                      return _buildTabletMenuCard(m, qty);
+                    },
+                  ),
                 ),
-                itemCount: _menu.length,
-                itemBuilder: (context, index) {
-                  final m = _menu[index];
-                  final qty = _qtyOf(m);
-                  return _buildTabletMenuCard(m, qty);
-                },
-              ),
-            ),
-        ],
-      ),
+            ],
+          ),
+        );
+      },
     );
   }
 
-  /// 平板菜单卡片 - 大按钮设计
+  /// 平板菜单卡片 - 大按钮设计（直接点击加减，不弹输入框）
   Widget _buildTabletMenuCard(MenuItem m, int qty) {
     final s = _uiScale;
+    final bool hasQty = qty > 0;
     return Card(
-      elevation: 2,
-      child: InkWell(
-        onTap: () => _editQtyDialog(m),
-        borderRadius: BorderRadius.circular(12),
-        child: Padding(
-          padding: EdgeInsets.all(10 * s),
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              // 菜品名称
-              Flexible(
+      elevation: hasQty ? 4 : 2,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(14),
+        side: hasQty
+            ? BorderSide(color: Colors.green.shade400, width: 2)
+            : BorderSide.none,
+      ),
+      child: Padding(
+        padding: EdgeInsets.symmetric(horizontal: 10 * s, vertical: 10 * s),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.center,
+          children: [
+            // 菜品名称（大字，居上，最多2行）
+            SizedBox(
+              height: 56 * s,
+              child: Center(
                 child: Text(
                   m.name,
-                  style: TextStyle(fontSize: 17 * s, fontWeight: FontWeight.bold),
+                  style: TextStyle(fontSize: 18 * s, fontWeight: FontWeight.bold, height: 1.3),
                   maxLines: 2,
                   overflow: TextOverflow.ellipsis,
                   textAlign: TextAlign.center,
                 ),
               ),
-              SizedBox(height: 4 * s),
-              // 价格
-              Text('${fmt(m.price)} $_currency',
-                  style: TextStyle(fontSize: 15 * s, color: Colors.grey[700], fontWeight: FontWeight.w500)),
-              const Spacer(),
-              // 数量控制和加减按钮
-              if (qty > 0) ...[
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    // 大减按钮
-                    SizedBox(
-                      width: 52 * s,
-                      height: 52 * s,
-                      child: FilledButton(
-                        style: FilledButton.styleFrom(
-                          backgroundColor: Colors.orange[300],
-                          padding: EdgeInsets.zero,
-                          minimumSize: Size(52 * s, 52 * s),
-                        ),
-                        onPressed: () => _decrease(m),
-                        child: Icon(Icons.remove, size: 26 * s),
-                      ),
-                    ),
-                    SizedBox(width: 8 * s),
-                    // 数量显示
-                    Container(
-                      width: 48 * s,
-                      alignment: Alignment.center,
-                      child: Text('$qty',
-                          style: TextStyle(fontSize: 22 * s, fontWeight: FontWeight.bold)),
-                    ),
-                    SizedBox(width: 8 * s),
-                    // 大加按钮
-                    SizedBox(
-                      width: 52 * s,
-                      height: 52 * s,
-                      child: FilledButton(
-                        style: FilledButton.styleFrom(
-                          backgroundColor: Colors.green[300],
-                          padding: EdgeInsets.zero,
-                          minimumSize: Size(52 * s, 52 * s),
-                        ),
-                        onPressed: () => _increase(m),
-                        child: Icon(Icons.add, size: 26 * s),
-                      ),
-                    ),
-                  ],
-                ),
-              ] else ...[
-                // 无数量时显示大添加按钮
-                SizedBox(
-                  width: double.infinity,
-                  height: 52 * s,
-                  child: FilledButton(
-                    style: FilledButton.styleFrom(
-                      backgroundColor: Colors.green[400],
-                    ),
-                    onPressed: () => _increase(m),
-                    child: Text('+ 添加', style: TextStyle(fontSize: 18 * s, color: Colors.white, fontWeight: FontWeight.bold)),
-                  ),
-                ),
+            ),
+            // 价格 + 辣度标签
+            Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                if (m.spicyEnabled)
+                  Text('🌶 ', style: TextStyle(fontSize: 13 * s)),
+                Text('${fmt(m.price)} $_currency',
+                    style: TextStyle(fontSize: 14 * s, color: Colors.grey[700], fontWeight: FontWeight.w500)),
               ],
+            ),
+            const Spacer(),
+            // 加减控制区
+            if (hasQty) ...[
+              Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  SizedBox(
+                    width: 48 * s,
+                    height: 48 * s,
+                    child: FilledButton(
+                      style: FilledButton.styleFrom(
+                        backgroundColor: Colors.orange[400],
+                        padding: EdgeInsets.zero,
+                      ),
+                      onPressed: () => _decrease(m),
+                      child: Icon(Icons.remove, size: 24 * s),
+                    ),
+                  ),
+                  SizedBox(
+                    width: 44 * s,
+                    child: Text(
+                      '$qty',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(fontSize: 24 * s, fontWeight: FontWeight.bold),
+                    ),
+                  ),
+                  SizedBox(
+                    width: 48 * s,
+                    height: 48 * s,
+                    child: FilledButton(
+                      style: FilledButton.styleFrom(
+                        backgroundColor: Colors.green[500],
+                        padding: EdgeInsets.zero,
+                      ),
+                      onPressed: () => _increase(m),
+                      child: Icon(Icons.add, size: 24 * s),
+                    ),
+                  ),
+                ],
+              ),
+            ] else ...[
+              SizedBox(
+                width: double.infinity,
+                height: 48 * s,
+                child: FilledButton(
+                  style: FilledButton.styleFrom(
+                    backgroundColor: Colors.green[400],
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                  ),
+                  // 直接加一，不弹输入框
+                  onPressed: () => _increase(m),
+                  child: Text('+ 添加', style: TextStyle(fontSize: 17 * s, color: Colors.white, fontWeight: FontWeight.bold)),
+                ),
+              ),
             ],
-          ),
+          ],
         ),
       ),
     );
@@ -2661,6 +2859,7 @@ class _SettingsPageState extends State<SettingsPage> {
   List<String> _logs = []; // 打印调试日志
   String _qrBase64 = ''; // 付款二维码 base64 PNG
   int _remainingDays = 30; // 授权剩余天数
+  bool _addSpicy = false; // 新添加菜品是否支持辣度选择
 
   String get _currency => _currencyCtrl.text.trim().isEmpty ? 'RM' : _currencyCtrl.text.trim();
 
@@ -2711,7 +2910,10 @@ class _SettingsPageState extends State<SettingsPage> {
       if (mounted) _showMsg('请输入菜品名称和正确的单价');
       return;
     }
-    setState(() => _menu.add(MenuItem(name: name, price: price)));
+    setState(() {
+      _menu.add(MenuItem(name: name, price: price, spicyEnabled: _addSpicy));
+      _addSpicy = false;
+    });
     _nameCtrl.clear();
     _priceCtrl.clear();
     await SettingsStore.saveMenu(_menu);
@@ -2723,32 +2925,47 @@ class _SettingsPageState extends State<SettingsPage> {
     final m = _menu[idx];
     final nCtrl = TextEditingController(text: m.name);
     final pCtrl = TextEditingController(text: '${m.price}');
+    bool editSpicy = m.spicyEnabled;
     final action = await showDialog<String>(
       context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('编辑菜单'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            TextField(
-                controller: nCtrl,
-                style: const TextStyle(fontSize: 18),
-                decoration: const InputDecoration(labelText: '菜品名称')),
-            const SizedBox(height: 8),
-            TextField(
-                controller: pCtrl,
-                keyboardType: const TextInputType.numberWithOptions(decimal: true),
-                style: const TextStyle(fontSize: 18),
-                decoration: InputDecoration(labelText: '单价（$_currency）')),
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDialogState) => AlertDialog(
+          title: const Text('编辑菜单'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(
+                  controller: nCtrl,
+                  style: const TextStyle(fontSize: 18),
+                  decoration: const InputDecoration(labelText: '菜品名称')),
+              const SizedBox(height: 8),
+              TextField(
+                  controller: pCtrl,
+                  keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                  style: const TextStyle(fontSize: 18),
+                  decoration: InputDecoration(labelText: '单价（$_currency）')),
+              const SizedBox(height: 8),
+              CheckboxListTile(
+                contentPadding: EdgeInsets.zero,
+                title: const Row(
+                  children: [
+                    Text('🌶 ', style: TextStyle(fontSize: 18)),
+                    Text('支持辣度选择 (辣/不辣)', style: TextStyle(fontSize: 15)),
+                  ],
+                ),
+                value: editSpicy,
+                onChanged: (v) => setDialogState(() => editSpicy = v ?? false),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+                onPressed: () => Navigator.pop(ctx, 'delete'),
+                child: const Text('删除', style: TextStyle(color: Colors.red))),
+            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
+            FilledButton(onPressed: () => Navigator.pop(ctx, 'save'), child: const Text('保存')),
           ],
         ),
-        actions: [
-          TextButton(
-              onPressed: () => Navigator.pop(ctx, 'delete'),
-              child: const Text('删除', style: TextStyle(color: Colors.red))),
-          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
-          FilledButton(onPressed: () => Navigator.pop(ctx, 'save'), child: const Text('保存')),
-        ],
       ),
     );
     if (action == 'delete') {
@@ -2762,7 +2979,7 @@ class _SettingsPageState extends State<SettingsPage> {
         if (mounted) _showMsg('名称或价格不正确');
         return;
       }
-      setState(() => _menu[idx] = MenuItem(name: name, price: price));
+      setState(() => _menu[idx] = MenuItem(name: name, price: price, spicyEnabled: editSpicy));
       await SettingsStore.saveMenu(_menu);
       if (mounted) _showMsg('已保存');
     }
@@ -3351,9 +3568,22 @@ class _SettingsPageState extends State<SettingsPage> {
                 return Card(
                   margin: const EdgeInsets.only(bottom: 6),
                   child: ListTile(
-                    title: Text(m.name, style: const TextStyle(fontSize: 17)),
-                    subtitle: Text('${fmt(m.price)} $_currency',
-                        style: const TextStyle(fontSize: 13, color: Colors.grey)),
+                    title: Row(
+                      children: [
+                        if (m.spicyEnabled)
+                          const Padding(
+                            padding: EdgeInsets.only(right: 6),
+                            child: Text('🌶', style: TextStyle(fontSize: 16)),
+                          ),
+                        Expanded(
+                          child: Text(m.name, style: const TextStyle(fontSize: 17)),
+                        ),
+                      ],
+                    ),
+                    subtitle: Text(
+                      '${fmt(m.price)} $_currency${m.spicyEnabled ? '  · 可选辣度' : ''}',
+                      style: const TextStyle(fontSize: 13, color: Colors.grey),
+                    ),
                     trailing: IconButton(
                       icon: const Icon(Icons.edit_outlined, color: Colors.blueGrey, size: 26),
                       tooltip: '编辑/删除',
@@ -3393,6 +3623,18 @@ class _SettingsPageState extends State<SettingsPage> {
                           child: const Text('添加', style: TextStyle(fontSize: 18)),
                         ),
                       ],
+                    ),
+                    const SizedBox(height: 4),
+                    CheckboxListTile(
+                      contentPadding: EdgeInsets.zero,
+                      title: const Row(
+                        children: [
+                          Text('🌶 ', style: TextStyle(fontSize: 16)),
+                          Text('支持辣度选择 (辣/不辣)', style: TextStyle(fontSize: 14)),
+                        ],
+                      ),
+                      value: _addSpicy,
+                      onChanged: (v) => setState(() => _addSpicy = v ?? false),
                     ),
                   ],
                 ),
