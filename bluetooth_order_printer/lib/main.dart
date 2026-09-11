@@ -24,16 +24,34 @@ const platform = MethodChannel('com.example.bluetooth_order_printer/bluetooth');
 
 // ==================== 数据模型 ====================
 
+/// 标签定义（设置页维护）
+///  - type='cat'    品类标签：把多个菜单项合并成同一款产品统计（如"鸡架"）
+///  - type='flavor' 口味标签：在品类内部再细分（如"原味""辣味"）
+/// isSpicy 只对口味标签有意义：吃这个口味要多一道工序，厨房后做
+class TagDef {
+  String name;
+  String type; // 'cat' 品类 / 'flavor' 口味
+  bool isSpicy;
+
+  TagDef({required this.name, required this.type, this.isSpicy = false});
+
+  bool get isCat => type == 'cat';
+}
+
 /// 菜单项（设置页维护）
 class MenuItem {
   String name;
   double price;
-  bool spicyEnabled; // 是否支持选择辣/不辣（在设置中勾选）
+  bool spicyEnabled; // 已废弃：旧的"支持辣度选择"开关，仅为兼容旧数据保留
+  String catTag; // 品类标签名（如"鸡架"），空=未分类
+  String flavorTag; // 口味标签名（如"原味""辣味"），空=无口味标记
 
   MenuItem({
     required this.name,
     required this.price,
     this.spicyEnabled = false,
+    this.catTag = '',
+    this.flavorTag = '',
   });
 }
 
@@ -41,13 +59,17 @@ class OrderItem {
   String name;
   double price;
   int quantity;
-  bool isSpicy; // 是否加辣
+  bool isSpicy; // 是否加辣（点单时按口味标签算好，快照保存）
+  String catTag; // 品类标签快照（点单时从菜单项复制，之后改菜单不影响历史单）
+  String flavorTag; // 口味标签快照
 
   OrderItem({
     required this.name,
     required this.price,
     required this.quantity,
     this.isSpicy = false,
+    this.catTag = '',
+    this.flavorTag = '',
   });
 
   /// 小计 = 单价 × 数量，保留两位小数
@@ -61,6 +83,13 @@ class Order {
   double total;
   String note;
   DateTime time;
+
+  /// 用餐方式：'dinein'=堂食（默认） 'takeaway'=打包 ''=未标记（旧版本订单）
+  String diningType;
+
+  /// 桌号（仅堂食有意义；空串 = 未指定桌号）
+  String tableNo;
+
   Order({
     required this.id,
     required this.orderNo,
@@ -68,7 +97,38 @@ class Order {
     required this.total,
     required this.note,
     required this.time,
+    this.diningType = 'dinein',
+    this.tableNo = '',
   });
+
+  bool get isDineIn => diningType == 'dinein';
+  bool get isTakeaway => diningType == 'takeaway';
+
+  /// 用餐方式打印文字：
+  ///   堂食 + 桌号 → "堂食(Table:65)"；堂食未选桌号 → "堂食"
+  ///   打包        → "打包"
+  ///   旧订单未标记 → 空串（不打印这一行）
+  String get diningLabel {
+    if (isDineIn) {
+      final t = tableNo.trim();
+      return t.isEmpty ? '堂食' : '堂食(Table:$t)';
+    }
+    if (isTakeaway) return '打包';
+    return '';
+  }
+
+  /// 备菜汇总单号前缀："(堂食)" / "(打包)" / 空串（旧订单未标记，沿用旧格式）
+  String get diningPrefix {
+    if (isDineIn) return '(堂食)';
+    if (isTakeaway) return '(打包)';
+    return '';
+  }
+
+  /// 整单里是否有加辣的菜品（有一份就算含辣）
+  bool get hasSpicy => items.any((i) => i.isSpicy);
+
+  /// 无辣单：整单没有任何加辣菜品 → 厨房不用多一道工序，可以先出
+  bool get isPlainOnly => items.isNotEmpty && !hasSpicy;
 }
 
 // ==================== 本地存储（菜单 + 外卖单号）====================
@@ -80,6 +140,8 @@ class SettingsStore {
 
   // ---- 店铺名称（小票标题）----
   static const _storeNameKey = 'store_name';
+  // 是否在小票上显示店铺名称（true=显示，false=隐藏）
+  static const _showNameKey = 'show_store_name';
 
   static Future<String> getStoreName() async {
     final prefs = await SharedPreferences.getInstance();
@@ -89,6 +151,29 @@ class SettingsStore {
   static Future<void> setStoreName(String name) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_storeNameKey, name);
+  }
+
+  static Future<bool> getShowName() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_showNameKey) ?? true;
+  }
+
+  static Future<void> setShowName(bool v) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_showNameKey, v);
+  }
+
+  // 是否在小票上显示副标题（与店名独立，关闭店名仍可保留副标题）
+  static const _showSubtitleKey = 'show_subtitle';
+
+  static Future<bool> getShowSubtitle() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_showSubtitleKey) ?? true;
+  }
+
+  static Future<void> setShowSubtitle(bool v) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_showSubtitleKey, v);
   }
 
   // ---- 小票样式（固定内容 + 字号 + 货币符号）----
@@ -293,6 +378,8 @@ class SettingsStore {
           name: m['n'] as String,
           price: (m['p'] as num).toDouble(),
           spicyEnabled: m['s'] as bool? ?? false,
+          catTag: (m['c'] as String?) ?? '',
+          flavorTag: (m['f'] as String?) ?? '',
         ));
       } catch (_) {}
     }
@@ -307,9 +394,66 @@ class SettingsStore {
         'n': m.name,
         'p': m.price,
         's': m.spicyEnabled,
+        'c': m.catTag,
+        'f': m.flavorTag,
       })).toList(),
     );
   }
+
+  // ---- 标签库（品类 / 口味，设置页维护）----
+  static const _tagKey = 'tag_defs';
+
+  static Future<List<TagDef>> loadTags() async {
+    final prefs = await SharedPreferences.getInstance();
+    final list = prefs.getStringList(_tagKey) ?? [];
+    final tags = <TagDef>[];
+    for (final s in list) {
+      try {
+        final m = jsonDecode(s) as Map<String, dynamic>;
+        final name = (m['n'] as String?) ?? '';
+        if (name.trim().isEmpty) continue;
+        tags.add(TagDef(
+          name: name,
+          type: (m['t'] as String?) ?? 'flavor',
+          isSpicy: m['s'] as bool? ?? false,
+        ));
+      } catch (_) {}
+    }
+    return tags;
+  }
+
+  static Future<void> saveTags(List<TagDef> tags) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList(
+      _tagKey,
+      tags
+          .map((t) => jsonEncode({'n': t.name, 't': t.type, 's': t.isSpicy}))
+          .toList(),
+    );
+  }
+
+  /// 按名称找标签；type 传 null 表示不限类型（取第一个同名标签）
+  static TagDef? findTag(List<TagDef> tags, String name, {String? type}) {
+    for (final t in tags) {
+      if (t.name == name && (type == null || t.type == type)) return t;
+    }
+    return null;
+  }
+
+  /// 该口味标签是否属于"辣"（没定义或找不到都按不辣处理）
+  static bool isSpicyFlavor(List<TagDef> tags, String flavorTag) {
+    if (flavorTag.trim().isEmpty) return false;
+    final t = findTag(tags, flavorTag, type: 'flavor');
+    return t?.isSpicy ?? false;
+  }
+
+  /// 取所有品类标签名（去重，保持定义顺序）
+  static List<String> catTagNames(List<TagDef> tags) =>
+      tags.where((t) => t.isCat).map((t) => t.name).toList();
+
+  /// 取所有口味标签名（去重，保持定义顺序）
+  static List<String> flavorTagNames(List<TagDef> tags) =>
+      tags.where((t) => !t.isCat).map((t) => t.name).toList();
 
   // ---- 外卖单号 ----
   static Future<int> getStartNo() async {
@@ -343,6 +487,70 @@ class SettingsStore {
     await prefs.setString(_qrKey, base64);
   }
 
+  // ---- 招牌图片 ----
+  static const _logoKey = 'logo_base64';
+  static const _logoPrintEnabledKey = 'logo_print_enabled';
+  static const _logoPrintSizeKey = 'logo_print_size';
+
+  static Future<String> getLogoBase64() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getString(_logoKey) ?? '';
+  }
+
+  static Future<void> setLogoBase64(String base64) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_logoKey, base64);
+  }
+
+  static Future<bool> getLogoPrintEnabled() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_logoPrintEnabledKey) ?? true;
+  }
+
+  static Future<void> setLogoPrintEnabled(bool v) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_logoPrintEnabledKey, v);
+  }
+
+  /// 招牌打印大小：0=小 1=中 2=大
+  static Future<int> getLogoPrintSize() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getInt(_logoPrintSizeKey) ?? 1;
+  }
+
+  static Future<void> setLogoPrintSize(int v) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt(_logoPrintSizeKey, v);
+  }
+
+  // ---- 付款二维码打印大小（点阵像素）----
+  static const _qrSizeKey = 'qr_print_size';
+
+  /// 二维码打印大小（单位：像素点），有效范围 1~384（50mm纸满宽）
+  static Future<int> getQrPrintSize() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getInt(_qrSizeKey) ?? 0; // 0=自动（默认中大小）
+  }
+
+  static Future<void> setQrPrintSize(int v) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt(_qrSizeKey, v);
+  }
+
+  // ---- 桌号（堂食订单下拉选择，设置页维护）----
+  static const _tableNosKey = 'table_nos';
+
+  /// 桌号列表（按设置页添加顺序保存）
+  static Future<List<String>> getTableNos() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getStringList(_tableNosKey) ?? [];
+  }
+
+  static Future<void> setTableNos(List<String> list) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList(_tableNosKey, list);
+  }
+
   /// 取下一单号并自增，如 1 → "001"，下一次取 2
   static Future<int> takeNextNo() async {
     final prefs = await SharedPreferences.getInstance();
@@ -368,10 +576,14 @@ String encodeOrder(Order o) => jsonEncode({
         'p': i.price,
         'q': i.quantity,
         's': i.isSpicy,
+        'c': i.catTag,
+        'f': i.flavorTag,
       }).toList(),
       'total': o.total,
       'note': o.note,
       'time': o.time.toIso8601String(),
+      'dt': o.diningType, // 用餐方式：dinein / takeaway
+      'tn': o.tableNo, // 堂食桌号
     });
 
 Order? decodeOrder(String json) {
@@ -385,6 +597,9 @@ Order? decodeOrder(String json) {
         price: (m['p'] as num).toDouble(),
         quantity: (m['q'] as num).toInt(),
         isSpicy: m['s'] as bool? ?? false,
+        // 旧订单没有标签快照 → 空串，打印时回退到按菜名分组
+        catTag: (m['c'] as String?) ?? '',
+        flavorTag: (m['f'] as String?) ?? '',
       );
     }).toList();
     return Order(
@@ -395,6 +610,9 @@ Order? decodeOrder(String json) {
       total: (map['total'] as num).toDouble(),
       note: map['note'] as String? ?? '',
       time: DateTime.parse(map['time'] as String),
+      // 旧版本订单没有用餐方式字段 → 空串表示"未标记"，打印时沿用旧格式
+      diningType: (map['dt'] as String?) ?? '',
+      tableNo: (map['tn'] as String?) ?? '',
     );
   } catch (_) {
     return null;
@@ -446,6 +664,26 @@ String _truncateW(String s, int w) {
   return '${buf}..';
 }
 
+/// 按半角宽度自动换行，返回多行列表（每行显示宽度 <= maxW）
+List<String> _wrapLines(String s, int maxW) {
+  if (s.isEmpty) return [s];
+  final lines = <String>[];
+  var cur = StringBuffer();
+  var curW = 0;
+  for (final c in s.runes) {
+    final cw = c > 0xFF ? 2 : 1;
+    if (curW + cw > maxW) {
+      lines.add(cur.toString());
+      cur = StringBuffer();
+      curW = 0;
+    }
+    cur.writeCharCode(c);
+    curW += cw;
+  }
+  if (cur.isNotEmpty) lines.add(cur.toString());
+  return lines.isEmpty ? [s] : lines;
+}
+
 /// 小票样式配置（全部可在设置页修改）
 class ReceiptSettings {
   final String paperWidth; // 纸张规格 '50mm' 或 '80mm'
@@ -464,7 +702,13 @@ class ReceiptSettings {
   final String priceLabel; // "单价" 标签
   final String subtotalLabel; // "小计" 标签
   final String totalLabel; // "合计金额" 标签
-  final String qrBase64; // 付款二维码 base64 PNG（空则不打印）
+  final String qrBase64;        // 付款二维码 base64 PNG（空则不打印）
+  final String logoBase64;       // 招牌图片 base64 PNG（空则不打印）
+  final bool logoPrintEnabled;   // 是否打印招牌图片
+  final int logoPrintSize;       // 打印大小：0=小 1=中 2=大
+  final bool showName;           // 是否显示店铺名称（true=显示，false=隐藏）
+  final bool showSubtitle;       // 是否显示副标题（与店名独立）
+  final int qrPrintSize;         // 付款二维码打印大小：0=自动 非0=像素点数
   const ReceiptSettings({
     required this.paperWidth,
     required this.storeName,
@@ -483,6 +727,12 @@ class ReceiptSettings {
     required this.subtotalLabel,
     required this.totalLabel,
     this.qrBase64 = '',
+    this.logoBase64 = '',
+    this.logoPrintEnabled = true,
+    this.logoPrintSize = 1,
+    this.showName = true,
+    this.showSubtitle = true,
+    this.qrPrintSize = 0,
   });
 }
 
@@ -509,31 +759,21 @@ Future<ReceiptSettings> loadReceiptSettings() async {
     subtotalLabel: await SettingsStore.getSubtotalLabel(),
     totalLabel: await SettingsStore.getTotalLabel(),
     qrBase64: await SettingsStore.getPaymentQr(),
+    logoBase64: await SettingsStore.getLogoBase64(),
+    logoPrintEnabled: await SettingsStore.getLogoPrintEnabled(),
+    logoPrintSize: await SettingsStore.getLogoPrintSize(),
+    showName: await SettingsStore.getShowName(),
+    showSubtitle: await SettingsStore.getShowSubtitle(),
+    qrPrintSize: await SettingsStore.getQrPrintSize(),
   );
 }
 
-/// 24点阵 (18列 x 24行) 经典卡通小辣椒 🌶 ESC * 33 双密度位图指令
-final Uint8List _kChiliEscPosBytes = Uint8List.fromList([
-  0x1B, 0x2A, 33, 18, 0, // ESC * 33 nL=18, nH=0 (24-dot double density)
-  0x00, 0x00, 0x00, // col 0
-  0x00, 0x20, 0x00, // col 1
-  0x00, 0x30, 0x00, // col 2
-  0x00, 0x38, 0x00, // col 3
-  0x00, 0x3C, 0x00, // col 4
-  0x00, 0x7E, 0x00, // col 5
-  0x01, 0xFF, 0x00, // col 6
-  0x03, 0xFF, 0x80, // col 7
-  0x07, 0xFF, 0xC0, // col 8
-  0x0F, 0xFF, 0xE0, // col 9
-  0x1F, 0xFF, 0xF0, // col 10
-  0x3F, 0xFF, 0xF8, // col 11
-  0x7F, 0xFF, 0xFC, // col 12
-  0x7F, 0xFF, 0xFE, // col 13
-  0x6F, 0xFF, 0xFF, // col 14
-  0x47, 0xFF, 0xFE, // col 15
-  0x03, 0xFF, 0xF8, // col 16
-  0x00, 0xFE, 0x00, // col 17
-]);
+int _getLogoPx(String paperWidth, int sizeIndex) {
+  final is80mm = paperWidth == '80mm';
+  if (sizeIndex == 0) return is80mm ? 160 : 120;
+  if (sizeIndex == 2) return is80mm ? 420 : 300;
+  return is80mm ? 280 : 200; // 默认中 (1)
+}
 
 String buildEscPos(Order o, ReceiptSettings s) {
   final sb = StringBuffer();
@@ -543,27 +783,39 @@ String buildEscPos(Order o, ReceiptSettings s) {
   final lineWidth = is80mm ? 48 : 32;
 
   // ===== 店铺标题：居中 + 可调字号（设置页可改）=====
-  final title = cleanText(s.storeName.trim().isEmpty ? '美味小馆' : s.storeName.trim());
-  final titleMax = switch (s.titleFont) {
-    0 => is80mm ? 44 : 30,
-    3 => is80mm ? 12 : 8,
-    _ => is80mm ? 24 : 16,
-  };
-  final td = _dispWidth(title) > titleMax ? _truncateW(title, titleMax) : title;
-  sb.write('\x1B\x61\x01'); // 居中
-  sb.write('\x1D\x21');
-  sb.writeCharCode(_gsFonts[s.titleFont]);
-  sb.writeln('*$td*');
-  sb.write('\x1D\x21\x00');
-  sb.write('\x1B\x61\x00'); // 左对齐
-  // ===== 副标题两行（设置页可配，留空不打印；1x1 字号，比店名小）=====
-  final sub1 = cleanText(s.subtitle1.trim());
-  final sub2 = cleanText(s.subtitle2.trim());
-  if (sub1.isNotEmpty || sub2.isNotEmpty) {
+  if (s.showName) {
+    final title = cleanText(s.storeName.trim().isEmpty ? '美味小馆' : s.storeName.trim());
+    final titleMax = switch (s.titleFont) {
+      0 => is80mm ? 44 : 30,
+      3 => is80mm ? 12 : 8,
+      _ => is80mm ? 24 : 16,
+    };
+    final td = _dispWidth(title) > titleMax ? _truncateW(title, titleMax) : title;
     sb.write('\x1B\x61\x01'); // 居中
-    if (sub1.isNotEmpty) sb.writeln(_truncateW(sub1, lineWidth));
-    if (sub2.isNotEmpty) sb.writeln(_truncateW(sub2, lineWidth));
+    sb.write('\x1D\x21');
+    sb.writeCharCode(_gsFonts[s.titleFont]);
+    sb.writeln('*$td*');
+    sb.write('\x1D\x21\x00');
     sb.write('\x1B\x61\x00'); // 左对齐
+  }
+  // ===== 副标题两行（设置页可配，留空不打印；独立于店名开关）=====
+  if (s.showSubtitle) {
+    final sub1 = cleanText(s.subtitle1.trim());
+    final sub2 = cleanText(s.subtitle2.trim());
+    if (sub1.isNotEmpty || sub2.isNotEmpty) {
+      sb.write('\x1B\x61\x01'); // 居中
+      if (sub1.isNotEmpty) {
+        for (final line in _wrapLines(sub1, lineWidth)) {
+          sb.writeln(line);
+        }
+      }
+      if (sub2.isNotEmpty) {
+        for (final line in _wrapLines(sub2, lineWidth)) {
+          sb.writeln(line);
+        }
+      }
+      sb.write('\x1B\x61\x00'); // 左对齐
+    }
   }
 
   // ===== 分隔线 + 时间（单号已移到底部；标签文字可配置）=====
@@ -597,12 +849,15 @@ String buildEscPos(Order o, ReceiptSettings s) {
   // ===== 商品行（含数量+单价的小计金额；单价不带货币符号）=====
   for (final it in o.items) {
     final rawName = cleanText(it.name);
-    final displayName = it.isSpicy ? '[辣]$rawName' : rawName;
-    final dn = _dispWidth(displayName) > nameW ? _truncateW(displayName, nameW) : displayName;
-    sb.writeln(_padTo(dn, nameW) +
+    final displayName = rawName;
+    final nameLines = _wrapLines(displayName, nameW);
+    sb.writeln(_padTo(nameLines[0], nameW) +
         _padCenter('${it.quantity}', qtyW) +
         _padTo(fmt(it.price), priceW, right: true) +
         _padTo('${s.currency}${fmt(it.subtotal)}', subtotalW, right: true));
+    for (var i = 1; i < nameLines.length; i++) {
+      sb.writeln(_padTo(nameLines[i], nameW) + ' ' * (qtyW + priceW + subtotalW));
+    }
   }
   sb.writeln('-' * lineWidth);
 
@@ -650,7 +905,7 @@ String buildEscPos(Order o, ReceiptSettings s) {
 ///  - 使用 100% 全兼容的 ESC * 33 (0x1B 0x2A 33 nL nH) 经典双密度 24 点阵指令
 ///  - 配合 ESC 3 0 (\x1B\x33\x00) 消除 Stripe 间白缝，图像纵向平滑连接
 ///  - 内置左右边距填充，使二维码 100% 居中，行宽与 50mm(384点) / 80mm(576点) 打印头完全一致
-Uint8List? _pngToEscPosRasterBytes(String base64Str, {required String paperWidth}) {
+Uint8List? _pngToEscPosRasterBytes(String base64Str, {required String paperWidth, int? targetPx, int qrPrintSize = 0}) {
   try {
     final parts = base64Str.split(',');
     final data = parts.length > 1 ? parts[1] : base64Str;
@@ -659,10 +914,12 @@ Uint8List? _pngToEscPosRasterBytes(String base64Str, {required String paperWidth
     if (decoded == null) return null;
 
     final is80mm = paperWidth == '80mm';
-    // 80mm 点阵总宽 576 点，二维码显示大小 288 点
-    // 50mm 点阵总宽 384 点，二维码显示大小 240 点
+    // 80mm 点阵总宽 576 点，50mm 点阵总宽 384 点
     final canvasWidth = is80mm ? 576 : 384;
-    final qrSize = is80mm ? 288 : 240;
+    // qrPrintSize: 0=自动，非0=用户指定像素数
+    final autoSizes = <int>[is80mm ? 192 : 160, is80mm ? 288 : 240, is80mm ? 432 : 320];
+    final defaultPx = qrPrintSize != 0 ? qrPrintSize : autoSizes[1];
+    final qrSize = (targetPx ?? defaultPx).clamp(1, canvasWidth);
 
     final leftPaddingDots = (canvasWidth - qrSize) ~/ 2;
 
@@ -736,38 +993,78 @@ List<Uint8List> buildEscPosBytesChunks(Order o, ReceiptSettings s) {
   final is80mm = s.paperWidth == '80mm';
   final lineWidth = is80mm ? 48 : 32;
 
+  // ===== 0. 用餐方式（堂食(Table:x) / 打包）：打在招牌图片上方，最先出现 =====
+  final diningLabel = o.diningLabel;
+  if (diningLabel.isNotEmpty) {
+    final sbDining = StringBuffer();
+    sbDining.write('\x1B\x40'); // ESC @ 初始化
+    sbDining.write('\x1B\x61\x01'); // 居中
+    sbDining.write('\x1D\x21');
+    sbDining.writeCharCode(_gsFonts[1]); // 1x2 放大
+    sbDining.writeln(cleanText(diningLabel));
+    sbDining.write('\x1D\x21\x00');
+    sbDining.write('\x1B\x61\x00'); // 左对齐
+    chunks.add(Uint8List.fromList(gbk.encode(sbDining.toString())));
+  }
+
+  // ===== 1. Logo =====
+  if (s.logoPrintEnabled && s.logoBase64.isNotEmpty) {
+    final logoPx = _getLogoPx(s.paperWidth, s.logoPrintSize);
+    final logoBytes = _pngToEscPosRasterBytes(s.logoBase64, paperWidth: s.paperWidth, targetPx: logoPx);
+    if (logoBytes != null && logoBytes.isNotEmpty) {
+      chunks.add(Uint8List.fromList([0x1B, 0x40])); // 初始化
+      chunks.add(logoBytes);
+      chunks.add(Uint8List.fromList(gbk.encode('\n')));
+    }
+  }
+
   // ===== 1. 头部内容 =====
   final sbHead = StringBuffer();
   sbHead.write('\x1B\x40'); // ESC @ 初始化打印机
 
-  // 店铺标题
-  final title = cleanText(s.storeName.trim().isEmpty ? '美味小馆' : s.storeName.trim());
-  final titleMax = switch (s.titleFont) {
-    0 => is80mm ? 44 : 30,
-    3 => is80mm ? 12 : 8,
-    _ => is80mm ? 24 : 16,
-  };
-  final td = _dispWidth(title) > titleMax ? _truncateW(title, titleMax) : title;
-  sbHead.write('\x1B\x61\x01'); // 居中
-  sbHead.write('\x1D\x21');
-  sbHead.writeCharCode(_gsFonts[s.titleFont]);
-  sbHead.writeln('*$td*');
-  sbHead.write('\x1D\x21\x00');
-  sbHead.write('\x1B\x61\x00'); // 左对齐
-
-  // 副标题
-  final sub1 = cleanText(s.subtitle1.trim());
-  final sub2 = cleanText(s.subtitle2.trim());
-  if (sub1.isNotEmpty || sub2.isNotEmpty) {
-    sbHead.write('\x1B\x61\x01');
-    if (sub1.isNotEmpty) sbHead.writeln(_truncateW(sub1, lineWidth));
-    if (sub2.isNotEmpty) sbHead.writeln(_truncateW(sub2, lineWidth));
-    sbHead.write('\x1B\x61\x00');
+  // 店铺标题（showName=false 时跳过）
+  if (s.showName) {
+    final title = cleanText(s.storeName.trim().isEmpty ? '美味小馆' : s.storeName.trim());
+    final titleMax = switch (s.titleFont) {
+      0 => is80mm ? 44 : 30,
+      3 => is80mm ? 12 : 8,
+      _ => is80mm ? 24 : 16,
+    };
+    final td = _dispWidth(title) > titleMax ? _truncateW(title, titleMax) : title;
+    sbHead.write('\x1B\x61\x01'); // 居中
+    sbHead.write('\x1D\x21');
+    sbHead.writeCharCode(_gsFonts[s.titleFont]);
+    sbHead.writeln('*$td*');
+    sbHead.write('\x1D\x21\x00');
+    sbHead.write('\x1B\x61\x00'); // 左对齐
   }
 
-  // 分隔线 + 时间
+  // 副标题（showSubtitle=false 时跳过，与店名独立控制）
+  if (s.showSubtitle) {
+    final sub1 = cleanText(s.subtitle1.trim());
+    final sub2 = cleanText(s.subtitle2.trim());
+    if (sub1.isNotEmpty || sub2.isNotEmpty) {
+      sbHead.write('\x1B\x61\x01');
+      if (sub1.isNotEmpty) {
+        for (final line in _wrapLines(sub1, lineWidth)) {
+          sbHead.writeln(line);
+        }
+      }
+      if (sub2.isNotEmpty) {
+        for (final line in _wrapLines(sub2, lineWidth)) {
+          sbHead.writeln(line);
+        }
+      }
+      sbHead.write('\x1B\x61\x00');
+    }
+  }
+
+  // 分隔线 + 时间（日/月/年 带年份，如 29/08/2026 14:30）
   sbHead.writeln('-' * lineWidth);
-  sbHead.writeln('${s.timeLabel.trim().isEmpty ? '时间' : s.timeLabel.trim()}：${formatTime(o.time)}');
+  final t = o.time;
+  final dateStr = '${t.day.toString().padLeft(2, '0')}/${t.month.toString().padLeft(2, '0')}/${t.year}';
+  final timeStr = '${t.hour.toString().padLeft(2, '0')}:${t.minute.toString().padLeft(2, '0')}';
+  sbHead.writeln('${s.timeLabel.trim().isEmpty ? '时间' : s.timeLabel.trim()}：$dateStr $timeStr');
   sbHead.writeln('-' * lineWidth);
 
   // 正文字号
@@ -798,34 +1095,23 @@ List<Uint8List> buildEscPosBytesChunks(Order o, ReceiptSettings s) {
     chunks.add(Uint8List.fromList(gbk.encode(l)));
   }
 
-  // ===== 2. 商品行列表（精准支持 🌶 辣椒位图图标）=====
+  // ===== 2. 商品行列表（自动换行；发票不标辣，辣/不辣由厨房单与备菜汇总体现）=====
   for (final it in o.items) {
     final cleanName = cleanText(it.name);
-    if (it.isSpicy) {
-      // 辣椒图案占约 2 字符宽度，剩余宽度放菜品名
-      final availW = nameW > 2 ? nameW - 2 : nameW;
-      final dn = _dispWidth(cleanName) > availW ? _truncateW(cleanName, availW) : cleanName;
-      final paddedName = _padTo(dn, availW);
+    final nameLines = _wrapLines(cleanName, nameW);
+    // 第一行带上数量、单价、小计
+    final lineStr = _padTo(nameLines[0], nameW) +
+        _padCenter('${it.quantity}', qtyW) +
+        _padTo(fmt(it.price), priceW, right: true) +
+        _padTo('${s.currency}${fmt(it.subtotal)}', subtotalW, right: true) +
+        '\n';
+    chunks.add(Uint8List.fromList(gbk.encode(lineStr)));
 
-      final rowBytes = <int>[];
-      // 插入 🌶 辣椒位图点阵
-      rowBytes.addAll(_kChiliEscPosBytes);
-      // 插入后续菜品名 + 数量 + 单价 + 小计 + 换行
-      final restStr = paddedName +
-          _padCenter('${it.quantity}', qtyW) +
-          _padTo(fmt(it.price), priceW, right: true) +
-          _padTo('${s.currency}${fmt(it.subtotal)}', subtotalW, right: true) +
-          '\n';
-      rowBytes.addAll(gbk.encode(restStr));
-      chunks.add(Uint8List.fromList(rowBytes));
-    } else {
-      final dn = _dispWidth(cleanName) > nameW ? _truncateW(cleanName, nameW) : cleanName;
-      final lineStr = _padTo(dn, nameW) +
-          _padCenter('${it.quantity}', qtyW) +
-          _padTo(fmt(it.price), priceW, right: true) +
-          _padTo('${s.currency}${fmt(it.subtotal)}', subtotalW, right: true) +
-          '\n';
-      chunks.add(Uint8List.fromList(gbk.encode(lineStr)));
+    // 剩余行只打印名字，数量/单价/小计列留空
+    for (var i = 1; i < nameLines.length; i++) {
+      final extraLine = _padTo(nameLines[i], nameW) +
+          ' ' * (qtyW + priceW + subtotalW) + '\n';
+      chunks.add(Uint8List.fromList(gbk.encode(extraLine)));
     }
   }
 
@@ -833,7 +1119,22 @@ List<Uint8List> buildEscPosBytesChunks(Order o, ReceiptSettings s) {
   final sbFoot = StringBuffer();
   sbFoot.writeln('-' * lineWidth);
   final totalLabel = s.totalLabel.trim().isEmpty ? '合计金额' : s.totalLabel.trim();
-  sbFoot.writeln(_padTo('$totalLabel：${s.currency}${fmt(o.total)}', lineWidth, right: true));
+  // TOTAL 金额：放大 2 号（2x2 大字）并加粗（ESC E），标签同样加粗
+  // 行内切字号：填充空格按默认列宽计算，金额按 2 倍宽预留，保证右对齐且不折行
+  final totalLabelStr = '$totalLabel：';
+  final totalAmountStr = '${s.currency} ${fmt(o.total)}'; // 钱符与金额空一格
+  final totalPad = (lineWidth - _dispWidth(totalLabelStr) - _dispWidth(totalAmountStr) * 2)
+      .clamp(0, lineWidth);
+  sbFoot.write(' ' * totalPad);
+  sbFoot.write('\x1B\x45\x01'); // ESC E 1 加粗开（标签与金额均加粗）
+  sbFoot.write(totalLabelStr);
+  sbFoot.write('\x1D\x21');
+  sbFoot.writeCharCode(_gsFonts[3]); // 2x2 大字
+  sbFoot.write(totalAmountStr);
+  sbFoot.write('\x1D\x21');
+  sbFoot.writeCharCode(useBodyFont ? _gsFonts[s.bodyFont] : 0x00); // 恢复正文字号
+  sbFoot.write('\x1B\x45\x00'); // 加粗关
+  sbFoot.writeln();
 
   if (o.note.isNotEmpty) {
     sbFoot.writeln('备注：${cleanText(o.note)}');
@@ -872,7 +1173,7 @@ List<Uint8List> buildEscPosBytesChunks(Order o, ReceiptSettings s) {
 
   // ===== 4. 付款二维码位图数据 =====
   if (s.qrBase64.isNotEmpty) {
-    final qrBytes = _pngToEscPosRasterBytes(s.qrBase64, paperWidth: s.paperWidth);
+    final qrBytes = _pngToEscPosRasterBytes(s.qrBase64, paperWidth: s.paperWidth, qrPrintSize: s.qrPrintSize);
     if (qrBytes != null && qrBytes.isNotEmpty) {
       chunks.add(qrBytes);
     }
@@ -880,6 +1181,329 @@ List<Uint8List> buildEscPosBytesChunks(Order o, ReceiptSettings s) {
 
   // ===== 5. 走纸 5 行 =====
   chunks.add(Uint8List.fromList(gbk.encode('\x1B\x64\x05')));
+
+  return chunks;
+}
+
+/// 构建厨房联小票并生成 Byte 块列表（简洁烧烤风格，包含 emoji 🦴🍗🐔）
+List<Uint8List> buildKitchenEscPosBytesChunks(Order o, ReceiptSettings s) {
+  final chunks = <Uint8List>[];
+  final is80mm = s.paperWidth == '80mm';
+  final lineWidth = is80mm ? 48 : 32;
+
+  // ===== 0. Logo（厨房单不打印招牌图片，仅发票打印）=====
+
+  // ===== 1. 头部内容 =====
+  final sbHead = StringBuffer();
+  sbHead.write('\x1B\x40'); // ESC @ 初始化打印机
+
+  // 用餐方式（堂食(Table:x) / 打包）：打在最顶部，厨房一眼看到送餐方式
+  final diningLabel = o.diningLabel;
+  if (diningLabel.isNotEmpty) {
+    sbHead.write('\x1B\x61\x01'); // 居中
+    sbHead.write('\x1D\x21');
+    sbHead.writeCharCode(_gsFonts[1]); // 1x2 放大
+    sbHead.writeln(cleanText(diningLabel));
+    sbHead.write('\x1D\x21\x00');
+    sbHead.write('\x1B\x61\x00'); // 左对齐
+  }
+
+  // 店铺标题（showName=false 时跳过）
+  if (s.showName) {
+    final title = cleanText(s.storeName.trim().isEmpty ? '美味小馆' : s.storeName.trim());
+    sbHead.write('\x1B\x61\x01'); // 居中
+    sbHead.write('\x1D\x21');
+    sbHead.writeCharCode(_gsFonts[s.titleFont]);
+    sbHead.writeln(title);
+    sbHead.write('\x1D\x21\x00');
+    sbHead.write('\x1B\x61\x00'); // 左对齐
+  }
+
+  // 厨房单不打印副标题 1、2（仅发票打印，与店名无关）
+
+  // ORDER 这一行
+  final dateStr = '${o.time.year}${o.time.month.toString().padLeft(2, '0')}${o.time.day.toString().padLeft(2, '0')}';
+  final orderNumPadded = o.orderNo.padLeft(4, '0');
+  final timeStr = '${o.time.hour.toString().padLeft(2, '0')}:${o.time.minute.toString().padLeft(2, '0')}';
+  
+  sbHead.writeln('=' * lineWidth);
+  sbHead.writeln('ORDER:$dateStr$orderNumPadded  $timeStr');
+  sbHead.writeln('=' * lineWidth);
+
+  // 外卖单号大字（居中，与发票尾部的单号风格一致，厨房一眼可见）
+  sbHead.write('\x1B\x61\x01'); // 居中
+  sbHead.write('\x1D\x21');
+  sbHead.writeCharCode(_gsFonts[s.orderNoFont]);
+  sbHead.writeln('外卖单号:$orderNumPadded');
+  sbHead.write('\x1D\x21\x00');
+  sbHead.write('\x1B\x61\x00'); // 左对齐
+
+  // 无辣 / 含辣 大字标记：厨房按这个决定先后（辣味的要多一道工序）
+  sbHead.write('\x1B\x61\x01'); // 居中
+  sbHead.write('\x1D\x21');
+  sbHead.writeCharCode(_gsFonts[1]); // 1x2 高
+  sbHead.writeln(o.isPlainOnly ? '** 无辣 **' : '** 含辣 **');
+  sbHead.write('\x1D\x21\x00');
+  sbHead.write('\x1B\x61\x00'); // 左对齐
+
+  // 写入头部
+  for (final l in _splitByLine(sbHead.toString())) {
+    chunks.add(Uint8List.fromList(gbk.encode(l)));
+  }
+
+  // ===== 2. 商品行列表（不进行 emoji 清理以保留 🦴🍗🐔，并自动换行）=====
+  // 厨房单产品字体固定放大为 1x2（GS ! 0x01：宽 1 倍、高 2 倍），方便厨房看清菜品；
+  // 宽度不变故折行宽度无需调整，与发票正文（1x1）相互独立
+  final bodyFontInit = '\x1D\x21\x01';
+  final bodyFontReset = '\x1D\x21\x00';
+
+  for (final it in o.items) {
+    // 保留原始名称中的 emoji；数量始终显示（包含数量为 1 时）
+    final displayName = it.name;
+    final qtySuffix = ' x${it.quantity}';
+    final fullLineText = '$displayName$qtySuffix';
+    
+    final nameLines = _wrapLines(fullLineText, lineWidth);
+    final itemSb = StringBuffer();
+    itemSb.write(bodyFontInit);
+    for (final line in nameLines) {
+      itemSb.writeln(line);
+    }
+    itemSb.write(bodyFontReset);
+    
+    chunks.add(Uint8List.fromList(gbk.encode(itemSb.toString())));
+  }
+
+  // ===== 3. 尾部内容 =====
+  final sbFoot = StringBuffer();
+  sbFoot.writeln('-' * lineWidth);
+  // TOTAL 金额：放大 2 号（2x2 大字）并加粗（ESC E），与发票一致
+  sbFoot.write('TOTAL: ');
+  sbFoot.write('\x1B\x45\x01'); // ESC E 1 加粗开
+  sbFoot.write('\x1D\x21');
+  sbFoot.writeCharCode(_gsFonts[3]); // 2x2 大字
+  sbFoot.write('${s.currency} ${fmt(o.total)}');
+  sbFoot.write('\x1D\x21\x00'); // 恢复默认字号
+  sbFoot.write('\x1B\x45\x00'); // 加粗关
+  sbFoot.writeln();
+  if (o.note.isNotEmpty) {
+    sbFoot.writeln('备注:${o.note}'); // 冒号后无空格
+  }
+
+  // 走纸 5 行
+  sbFoot.write('\x1B\x64\x05');
+
+  for (final l in _splitByLine(sbFoot.toString())) {
+    chunks.add(Uint8List.fromList(gbk.encode(l)));
+  }
+
+  return chunks;
+}
+
+// ==================== 备菜汇总聚合（打印与界面共用同一份逻辑）====================
+
+/// 一个品类分组的备菜统计：同一品类标签的菜合并到一起，按"辣 / 不辣"二分
+class PrepGroup {
+  final String name; // 显示名：有品类标签用标签名，没有则用菜品名
+  final bool byCategory; // true=挂了品类标签（展开"共/不辣/辣"），false=按菜名单行显示
+  final int plainQty; // 不辣份数（没标口味的算不辣）
+  final int spicyQty; // 辣份数
+  const PrepGroup({
+    required this.name,
+    required this.byCategory,
+    required this.plainQty,
+    required this.spicyQty,
+  });
+
+  int get total => plainQty + spicyQty;
+}
+
+/// 把若干订单按品类合并统计：
+///  - 挂了品类标签的菜（原味鸡架 + 辣味鸡架）合并成一个分组
+///  - 没挂品类标签的菜自己单独成组，沿用原来的按菜名统计
+/// 排序：按总份数降序（同数量按名称）
+List<PrepGroup> aggregatePrep(List<Order> orders) {
+  // 分组键 -> [不辣份数, 辣份数]；没标签的菜名加 ## 前缀，避免和同名品类标签撞车
+  final map = <String, List<int>>{};
+  final nameOf = <String, String>{};
+  for (final o in orders) {
+    for (final it in o.items) {
+      final cat = it.catTag.trim();
+      final key = cat.isEmpty ? '##${it.name}' : cat;
+      nameOf[key] = cat.isEmpty ? it.name : cat;
+      final e = map.putIfAbsent(key, () => [0, 0]);
+      if (it.isSpicy) {
+        e[1] += it.quantity;
+      } else {
+        e[0] += it.quantity;
+      }
+    }
+  }
+
+  return map.entries
+      .map((e) => PrepGroup(
+            name: nameOf[e.key] ?? e.key,
+            byCategory: !e.key.startsWith('##'),
+            plainQty: e.value[0],
+            spicyQty: e.value[1],
+          ))
+      .toList()
+    ..sort((a, b) {
+      final byQty = b.total.compareTo(a.total);
+      if (byQty != 0) return byQty;
+      return a.name.compareTo(b.name);
+    });
+}
+
+/// 汇总部分的分行文本（打印用）：
+///  挂了品类标签 → "[鸡翅] 共 10" + "  不辣 x 5" + "  辣 x 5"（辣为 0 也显示）
+///  没挂标签     → 单行 "矿泉水 x 2"
+List<String> prepGroupLines(PrepGroup g) {
+  if (!g.byCategory) return ['${g.name} x ${g.total}'];
+  return [
+    '[${g.name}] 共 ${g.total}',
+    '  不辣 x ${g.plainQty}',
+    '  辣 x ${g.spicyQty}',
+  ];
+}
+
+/// 分单明细部分：一张订单列出它的品类以及辣/不辣拆分。
+/// 例："订单号<1015>, [鸡翅] 辣 x 2, 不辣 x 1"
+/// 放不下时在品类边界换行（不会把品类名从中间劈开），续行缩进。
+/// 该品类下的菜都没标过口味时只写总量："[沙田鸡] x 1"
+List<String> prepOrderLines(Order o, int lineWidth) {
+  final map = <String, List<int>>{}; // 显示名 -> [不辣, 辣]
+  final marked = <String, bool>{}; // 该品类下有没有菜标过口味
+  final seq = <String>[]; // 首次出现顺序，稍后按份数重排
+  for (final it in o.items) {
+    final cat = it.catTag.trim();
+    final key = cat.isEmpty ? it.name : cat;
+    if (!map.containsKey(key)) seq.add(key);
+    final e = map.putIfAbsent(key, () => [0, 0]);
+    if (it.isSpicy) {
+      e[1] += it.quantity;
+    } else {
+      e[0] += it.quantity;
+    }
+    marked[key] = (marked[key] ?? false) || it.flavorTag.trim().isNotEmpty;
+  }
+  // 单内也按份数降序，跟上面的汇总顺序保持一致
+  seq.sort((a, b) {
+    final ta = map[a]![0] + map[a]![1];
+    final tb = map[b]![0] + map[b]![1];
+    final byQty = tb.compareTo(ta);
+    if (byQty != 0) return byQty;
+    return a.compareTo(b);
+  });
+
+  final parts = <String>[];
+  for (final k in seq) {
+    final e = map[k]!;
+    final segs = <String>[];
+    if (marked[k] ?? false) {
+      if (e[1] > 0) segs.add('辣 x ${e[1]}');
+      if (e[0] > 0) segs.add('不辣 x ${e[0]}');
+    }
+    parts.add(segs.isEmpty ? '[$k] x ${e[0] + e[1]}' : '[$k] ${segs.join(', ')}');
+  }
+
+  // 按纸宽在品类之间换行
+  // 用餐方式前缀：堂食/打包一目了然（旧订单未标记用餐方式时不加前缀）
+  final head = '${o.diningPrefix}订单号<${o.orderNo.padLeft(4, '0')}>';
+  const indent = '      ';
+  final lines = <String>[];
+  var cur = head;
+  var curW = _dispWidth(head);
+  for (final p in parts) {
+    final pw = _dispWidth(p);
+    if (cur.isNotEmpty && curW + 2 + pw > lineWidth) {
+      lines.add(cur);
+      cur = '';
+      curW = 0;
+    }
+    if (cur.isEmpty) {
+      cur = '$indent$p';
+      curW = _dispWidth(indent) + pw;
+    } else {
+      cur = '$cur, $p';
+      curW += 2 + pw;
+    }
+  }
+  lines.add(cur);
+  return lines;
+}
+
+/// 备菜汇总小票：上半部分按品类合计（含辣/不辣拆分），下半部分逐单明细。
+/// 挂了品类标签的菜（如"鸡架"下的原味/辣味）会合并成一组，
+/// 没挂标签的菜沿用按菜名统计。不打印金额，只打印数量。
+List<Uint8List> buildPrepSummaryEscPosBytesChunks(List<Order> orders, ReceiptSettings s) {
+  final chunks = <Uint8List>[];
+  final is80mm = s.paperWidth == '80mm';
+  final lineWidth = is80mm ? 48 : 32;
+
+  // ===== 两级汇总（与备菜页共用 aggregatePrep，保证屏幕与纸上一致）=====
+  final groups = aggregatePrep(orders);
+  var totalPieces = 0;
+  for (final o in orders) {
+    for (final it in o.items) {
+      totalPieces += it.quantity;
+    }
+  }
+  // 整单没有辣的单据数：厨房不用多一道工序，可以先出
+  final plainOrders = orders.where((o) => o.isPlainOnly).length;
+  final spicyOrders = orders.length - plainOrders;
+
+  final now = DateTime.now();
+  String two(int n) => n.toString().padLeft(2, '0');
+  final nowStr = '${now.year}-${two(now.month)}-${two(now.day)} ${two(now.hour)}:${two(now.minute)}';
+
+  final sb = StringBuffer();
+  sb.write('\x1B\x40'); // ESC @ 初始化打印机
+
+  // ===== 标题：居中放大 =====
+  sb.write('\x1B\x61\x01'); // 居中
+  sb.write('\x1D\x21');
+  sb.writeCharCode(_gsFonts[1]); // 1x2 高
+  sb.writeln('== 备菜汇总 ==');
+  sb.write('\x1D\x21\x00');
+  sb.write('\x1B\x61\x00'); // 左对齐
+
+  sb.writeln('时间：$nowStr');
+  sb.writeln('共 ${orders.length} 单 · $totalPieces 份');
+  sb.writeln('=' * lineWidth);
+
+  // ===== 上半部分：按品类合计（1x2 放大，与厨房单一致）=====
+  sb.write('\x1D\x21\x01');
+  for (final g in groups) {
+    for (final line in prepGroupLines(g)) {
+      for (final w in _wrapLines(line, lineWidth)) {
+        sb.writeln(w);
+      }
+    }
+  }
+  sb.write('\x1D\x21\x00');
+
+  sb.writeln('-' * lineWidth);
+
+  // ===== 下半部分：逐单明细（正常字号，信息量大省纸）=====
+  for (final o in orders) {
+    for (final line in prepOrderLines(o, lineWidth)) {
+      for (final w in _wrapLines(line, lineWidth)) {
+        sb.writeln(w);
+      }
+    }
+  }
+
+  sb.writeln('=' * lineWidth);
+  // 无辣单标记：整单没辣的厨房可以先出
+  sb.writeln('无辣 $plainOrders 单 · 含辣 $spicyOrders 单');
+
+  // 走纸 5 行
+  sb.write('\x1B\x64\x05');
+
+  for (final l in _splitByLine(sb.toString())) {
+    chunks.add(Uint8List.fromList(gbk.encode(l)));
+  }
 
   return chunks;
 }
@@ -1306,13 +1930,36 @@ class MainScreen extends StatefulWidget {
 
 class _MainScreenState extends State<MainScreen> {
   int _currentIndex = 0;
+  static const int _prepIndex = 3; // 备菜页在导航中的位置
+  static const int _entryIndex = 1; // 新建订单页在导航中的位置
 
-  final List<Widget> _pages = const [
-    BluetoothPage(),
-    OrderEntryPage(),
-    OrderHistoryPage(),
-    SettingsPage(),
+  /// 切到备菜页时自增，通知其重新加载最新订单
+  final ValueNotifier<int> _prepRefresh = ValueNotifier<int>(0);
+
+  /// 切到新建订单页时自增，通知其重新加载桌号（IndexedStack 页面常驻，
+  /// 在【设置】→ 桌号管理里增删后需要重新读一次）
+  final ValueNotifier<int> _entryRefresh = ValueNotifier<int>(0);
+
+  late final List<Widget> _pages = [
+    const BluetoothPage(),
+    OrderEntryPage(refreshSignal: _entryRefresh),
+    const OrderHistoryPage(),
+    PrepPage(refreshSignal: _prepRefresh),
+    const SettingsPage(),
   ];
+
+  void _onTabSelected(int i) {
+    setState(() => _currentIndex = i);
+    if (i == _prepIndex) _prepRefresh.value++;
+    if (i == _entryIndex) _entryRefresh.value++;
+  }
+
+  @override
+  void dispose() {
+    _prepRefresh.dispose();
+    _entryRefresh.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -1326,7 +1973,7 @@ class _MainScreenState extends State<MainScreen> {
           children: [
             NavigationRail(
               selectedIndex: _currentIndex,
-              onDestinationSelected: (i) => setState(() => _currentIndex = i),
+              onDestinationSelected: _onTabSelected,
               labelType: NavigationRailLabelType.all,
               leading: const Padding(
                 padding: EdgeInsets.symmetric(vertical: 16),
@@ -1349,6 +1996,11 @@ class _MainScreenState extends State<MainScreen> {
                   label: Text('历史', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
                 ),
                 NavigationRailDestination(
+                  icon: Icon(Icons.restaurant_menu, size: 28),
+                  selectedIcon: Icon(Icons.restaurant_menu, size: 28, color: Colors.blueGrey),
+                  label: Text('备菜', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+                ),
+                NavigationRailDestination(
                   icon: Icon(Icons.settings_outlined, size: 28),
                   selectedIcon: Icon(Icons.settings, size: 28, color: Colors.blueGrey),
                   label: Text('设置', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
@@ -1369,7 +2021,7 @@ class _MainScreenState extends State<MainScreen> {
       body: IndexedStack(index: _currentIndex, children: _pages),
       bottomNavigationBar: NavigationBar(
         selectedIndex: _currentIndex,
-        onDestinationSelected: (i) => setState(() => _currentIndex = i),
+        onDestinationSelected: _onTabSelected,
         destinations: const [
           NavigationDestination(
             icon: Icon(Icons.bluetooth_outlined),
@@ -1385,6 +2037,11 @@ class _MainScreenState extends State<MainScreen> {
             icon: Icon(Icons.history_outlined),
             selectedIcon: Icon(Icons.history),
             label: '历史',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.restaurant_menu),
+            selectedIcon: Icon(Icons.restaurant_menu),
+            label: '备菜',
           ),
           NavigationDestination(
             icon: Icon(Icons.settings_outlined),
@@ -1772,7 +2429,10 @@ class _BluetoothPageState extends State<BluetoothPage> {
 // ==================== 新建订单页面（外卖版）====================
 
 class OrderEntryPage extends StatefulWidget {
-  const OrderEntryPage({super.key});
+  const OrderEntryPage({super.key, this.refreshSignal});
+
+  /// 切换到本页时由 MainScreen 自增，通知重新加载桌号（设置页可能刚增删过）
+  final ValueNotifier<int>? refreshSignal;
 
   @override
   State<OrderEntryPage> createState() => _OrderEntryPageState();
@@ -1782,32 +2442,129 @@ class _OrderEntryPageState extends State<OrderEntryPage> {
   final _noteCtrl = TextEditingController();
   final List<OrderItem> _items = [];
   List<MenuItem> _menu = [];
+  List<TagDef> _tags = []; // 标签库（点单时把标签快照进订单明细）
   bool _printing = false;
   int _nextNo = 1; // 下一单号预览
   String _currency = 'RM'; // 货币符号（设置页可配置）
   double _uiScale = 1.0; // UI 缩放比例（0.8 ~ 1.6）
+  // 用餐方式：默认堂食；堂食时可选桌号（桌号列表在【设置】→ 桌号管理里维护）
+  String _diningType = 'dinein';
+  String _tableNo = '';
+  List<String> _tableNos = [];
 
   double get _total => _items.fold(0.0, (s, i) => s + i.subtotal);
 
   @override
   void initState() {
     super.initState();
+    widget.refreshSignal?.addListener(_onRefreshSignal);
     _loadData();
   }
 
+  @override
+  void dispose() {
+    widget.refreshSignal?.removeListener(_onRefreshSignal);
+    _noteCtrl.dispose();
+    super.dispose();
+  }
+
+  void _onRefreshSignal() => _loadData();
+
   Future<void> _loadData() async {
     final menu = await SettingsStore.loadMenu();
+    final tags = await SettingsStore.loadTags();
     final next = await SettingsStore.getCurrentNo();
     final currency = await SettingsStore.getCurrency();
     final scale = await SettingsStore.getUiScale();
+    final tableNos = await SettingsStore.getTableNos();
     if (mounted) {
       setState(() {
         _menu = menu;
+        _tags = tags;
         _nextNo = next;
         _currency = currency;
         _uiScale = scale;
+        _tableNos = tableNos;
+        // 设置页可能删掉了当前选中的桌号 → 回退为"不指定"
+        if (!_tableNos.contains(_tableNo)) _tableNo = '';
       });
     }
+  }
+
+  /// 用餐方式选择：堂食（默认）/ 打包；选堂食时多一个桌号下拉框。
+  /// 打印时会在小票最顶部输出 "堂食(Table:65)" / "打包"。
+  Widget _buildDiningSelector(double s) {
+    return Container(
+      padding: EdgeInsets.all(12 * s),
+      decoration: BoxDecoration(
+        color: Colors.orange[50],
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: Colors.orange[200]!),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Text('用餐方式',
+              style: TextStyle(fontSize: 15 * s, fontWeight: FontWeight.bold)),
+          Row(
+            children: [
+              Expanded(
+                child: RadioListTile<String>(
+                  contentPadding: EdgeInsets.zero,
+                  dense: true,
+                  visualDensity: VisualDensity.compact,
+                  value: 'dinein',
+                  groupValue: _diningType,
+                  onChanged: (v) => setState(() => _diningType = v ?? 'dinein'),
+                  title: Text('堂食',
+                      style: TextStyle(fontSize: 16 * s, fontWeight: FontWeight.bold)),
+                ),
+              ),
+              Expanded(
+                child: RadioListTile<String>(
+                  contentPadding: EdgeInsets.zero,
+                  dense: true,
+                  visualDensity: VisualDensity.compact,
+                  value: 'takeaway',
+                  groupValue: _diningType,
+                  onChanged: (v) => setState(() {
+                    _diningType = v ?? 'dinein';
+                    // 打包单不保留桌号，避免打印出 "打包(Table:65)"
+                    if (_diningType != 'dinein') _tableNo = '';
+                  }),
+                  title: Text('打包',
+                      style: TextStyle(fontSize: 16 * s, fontWeight: FontWeight.bold)),
+                ),
+              ),
+            ],
+          ),
+          if (_diningType == 'dinein') ...[
+            SizedBox(height: 4 * s),
+            if (_tableNos.isEmpty)
+              Text('暂无桌号，可先在【设置】→ 桌号管理里添加；不选桌号则只打印"堂食"',
+                  style: TextStyle(fontSize: 12 * s, color: Colors.grey))
+            else
+              DropdownButtonFormField<String>(
+                value: _tableNos.contains(_tableNo) ? _tableNo : '',
+                isDense: true,
+                decoration: InputDecoration(
+                  labelText: '桌号',
+                  isDense: true,
+                  border: const OutlineInputBorder(),
+                  contentPadding:
+                      EdgeInsets.symmetric(horizontal: 10 * s, vertical: 10 * s),
+                ),
+                items: [
+                  const DropdownMenuItem(value: '', child: Text('不指定桌号')),
+                  for (final t in _tableNos)
+                    DropdownMenuItem(value: t, child: Text('$t 号桌')),
+                ],
+                onChanged: (v) => setState(() => _tableNo = v ?? ''),
+              ),
+          ],
+        ],
+      ),
+    );
   }
 
   Future<void> _zoomIn() async {
@@ -1829,6 +2586,17 @@ class _OrderEntryPageState extends State<OrderEntryPage> {
     await SettingsStore.setUiScale(1.0);
   }
 
+  /// 按菜单项生成订单明细：把品类/口味标签和"是否辣"一起快照进去，
+  /// 以后改菜单或改标签名都不会影响已经下过的单。
+  OrderItem _itemFromMenu(MenuItem m, int qty) => OrderItem(
+        name: m.name,
+        price: m.price,
+        quantity: qty,
+        isSpicy: SettingsStore.isSpicyFlavor(_tags, m.flavorTag),
+        catTag: m.catTag,
+        flavorTag: m.flavorTag,
+      );
+
   int _qtyOf(MenuItem m) {
     for (final it in _items) {
       if (it.name == m.name && it.price == m.price) return it.quantity;
@@ -1840,9 +2608,9 @@ class _OrderEntryPageState extends State<OrderEntryPage> {
     setState(() {
       final idx = _items.indexWhere((it) => it.name == m.name && it.price == m.price);
       if (idx >= 0) {
-        _items[idx] = OrderItem(name: m.name, price: m.price, quantity: _items[idx].quantity + 1);
+        _items[idx] = _itemFromMenu(m, _items[idx].quantity + 1);
       } else {
-        _items.add(OrderItem(name: m.name, price: m.price, quantity: 1));
+        _items.add(_itemFromMenu(m, 1));
       }
     });
   }
@@ -1855,7 +2623,7 @@ class _OrderEntryPageState extends State<OrderEntryPage> {
         if (q <= 0) {
           _items.removeAt(idx);
         } else {
-          _items[idx] = OrderItem(name: m.name, price: m.price, quantity: q);
+          _items[idx] = _itemFromMenu(m, q);
         }
       }
     });
@@ -1889,9 +2657,9 @@ class _OrderEntryPageState extends State<OrderEntryPage> {
     setState(() {
       final idx = _items.indexWhere((it) => it.name == m.name && it.price == m.price);
       if (idx >= 0) {
-        _items[idx] = OrderItem(name: m.name, price: m.price, quantity: qty);
+        _items[idx] = _itemFromMenu(m, qty);
       } else {
-        _items.add(OrderItem(name: m.name, price: m.price, quantity: qty));
+        _items.add(_itemFromMenu(m, qty));
       }
     });
   }
@@ -1907,14 +2675,22 @@ class _OrderEntryPageState extends State<OrderEntryPage> {
       return;
     }
     // 检查蓝牙；未连接时自动重连一次（打印机可能已空闲断开）
+    // 仍未连接：弹窗提示，用户可选择「直接下单」——不打印，仅保存订单
+    var directOrderOnly = false;
     if (!await ensureBluetoothConnected()) {
       await SettingsStore.addLog('蓝牙未连接且自动重连失败');
-      if (mounted) {
-        showDialog(context: context, builder: (_) => _bluetoothErrorDialog());
-      }
-      return;
+      if (!mounted) return;
+      final direct = await showDialog<bool>(
+        context: context,
+        builder: (_) => _bluetoothErrorDialog(),
+      );
+      if (direct != true || !mounted) return;
+      directOrderOnly = true;
+      await SettingsStore.addLog('蓝牙未连接，用户选择直接下单（不打印）');
     }
-    await SettingsStore.addLog('蓝牙连接正常，开始下单');
+    if (!directOrderOnly) {
+      await SettingsStore.addLog('蓝牙连接正常，开始下单');
+    }
 
     // 顺序取下一单号（01、02、03...）
     final no = await SettingsStore.takeNextNo();
@@ -1925,45 +2701,69 @@ class _OrderEntryPageState extends State<OrderEntryPage> {
       total: _total,
       note: _noteCtrl.text.trim(),
       time: DateTime.now(),
+      diningType: _diningType,
+      tableNo: _diningType == 'dinein' ? _tableNo : '',
     );
 
     // 保存历史
     await _saveOrder(order);
 
-    // 生成并发送 ESC/POS 指令
-    setState(() => _printing = true);
-    try {
-      final settings = await loadReceiptSettings();
-      final chunks = buildEscPosBytesChunks(order, settings);
-      // 分批按字节包发送（解决位图点阵被转 GBK 变乱码问题）
-      final ok = await sendEscPosBytesChunked(chunks);
-      if (ok == true && mounted) {
-        await SettingsStore.addLog('打印成功');
+    // 直接下单（蓝牙未连接）：只保存订单与单号，不打印
+    if (directOrderOnly) {
+      if (mounted) {
         setState(() {
           _items.clear();
           _nextNo = no + 1;
         });
         _noteCtrl.clear();
-        _showMsg('单号 ${order.orderNo} 打印成功！');
-        // 询问是否多打印一张（如：顾客一张 + 厨房/留底一张）
-        final more = await showDialog<bool>(
+      }
+      await SettingsStore.addLog('直接下单成功（未打印）：单号 ${order.orderNo}');
+      if (mounted) {
+        _showMsg('单号 ${order.orderNo} 已下单（未打印），可在【历史】页补打');
+      }
+      return;
+    }
+
+    // 生成并发送 ESC/POS 指令
+    setState(() => _printing = true);
+    try {
+      final settings = await loadReceiptSettings();
+      // 第一张：发票
+      final chunks = buildEscPosBytesChunks(order, settings);
+      final ok = await sendEscPosBytesChunked(chunks);
+
+      if (ok == true && mounted) {
+        await SettingsStore.addLog('发票打印成功');
+        setState(() {
+          _items.clear();
+          _nextNo = no + 1;
+        });
+        _noteCtrl.clear();
+        _showMsg('单号 ${order.orderNo} 发票打印成功！');
+        
+        // 询问接下来打印什么
+        final choice = await showDialog<String>(
           context: context,
           builder: (ctx) => AlertDialog(
-            title: const Text('打印完成'),
-            content: Text('单号 ${order.orderNo} 已打印\n需要再多打印一张吗？'),
+            title: const Text('发票打印完成'),
+            content: Text('单号 ${order.orderNo} 发票已成功打印。\n请选择接下来要执行的操作：'),
             actions: [
               TextButton(
-                  onPressed: () => Navigator.pop(ctx, false), child: const Text('不需要')),
+                  onPressed: () => Navigator.pop(ctx, 'none'), child: const Text('完成 (不打印)')),
+              OutlinedButton(
+                  onPressed: () => Navigator.pop(ctx, 'invoice'), child: const Text('再打一张发票')),
               FilledButton(
-                  onPressed: () => Navigator.pop(ctx, true), child: const Text('再打一张')),
+                  onPressed: () => Navigator.pop(ctx, 'kitchen'), child: const Text('打印厨房单')),
             ],
           ),
         );
-        if (more == true && mounted) {
-          await _printOrder(order);
+        if (choice == 'invoice' && mounted) {
+          await _printOrder(order, isKitchen: false);
+        } else if (choice == 'kitchen' && mounted) {
+          await _printOrder(order, isKitchen: true);
         }
       } else if (mounted) {
-        await SettingsStore.addLog('打印失败，sendEscPosBytesChunked 返回: $ok');
+        await SettingsStore.addLog('发票打印失败，sendEscPosBytesChunked 返回: $ok');
         _showPrintError(ok is String ? ok : null);
       }
     } catch (e) {
@@ -1974,8 +2774,8 @@ class _OrderEntryPageState extends State<OrderEntryPage> {
     }
   }
 
-  /// 补打一张小票（打印完成→再打一张 用），不重复下单号
-  Future<bool> _printOrder(Order o) async {
+  /// 补打一张小票（不重复下单号）
+  Future<bool> _printOrder(Order o, {bool isKitchen = false}) async {
     if (!await ensureBluetoothConnected()) {
       await SettingsStore.addLog('补打：蓝牙未连接且自动重连失败');
       if (mounted) {
@@ -1991,11 +2791,13 @@ class _OrderEntryPageState extends State<OrderEntryPage> {
     }
     try {
       final settings = await loadReceiptSettings();
-      final chunks = buildEscPosBytesChunks(o, settings);
+      final chunks = isKitchen 
+          ? buildKitchenEscPosBytesChunks(o, settings)
+          : buildEscPosBytesChunks(o, settings);
       final ok = await sendEscPosBytesChunked(chunks);
       if (ok == true) {
         await SettingsStore.addLog('补打成功：单号 ${o.orderNo}');
-        if (mounted) _showMsg('已补打一张（单号 ${o.orderNo}）');
+        if (mounted) _showMsg('已补打一张 ${isKitchen ? "厨房单" : "发票"}（单号 ${o.orderNo}）');
         return true;
       } else {
         await SettingsStore.addLog('补打失败：单号 ${o.orderNo}，返回: $ok');
@@ -2032,10 +2834,20 @@ class _OrderEntryPageState extends State<OrderEntryPage> {
             ));
   }
 
+  /// 蓝牙未连接提示：可返回去连接，也可直接下单（不打印）
+  /// 返回 true = 直接下单，false/null = 取消
   Widget _bluetoothErrorDialog() => AlertDialog(
         title: const Text('蓝牙未连接'),
-        content: const Text('自动重连失败，请检查：\n• 打印机是否已开机\n• 是否在有效距离内（10米）\n• 手机系统蓝牙是否已配对\n\n然后回到【蓝牙】页面手动连接'),
-        actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('确定'))],
+        content: const Text('自动重连失败，请检查：\n• 打印机是否已开机\n• 是否在有效距离内（10米）\n• 手机系统蓝牙是否已配对\n\n可回到【蓝牙】页面手动连接后重试，\n或点「直接下单」先保存订单（之后可在【历史】页补打）。'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(context, false), child: const Text('取消')),
+          FilledButton.icon(
+            onPressed: () => Navigator.pop(context, true),
+            icon: const Icon(Icons.receipt_long),
+            label: const Text('直接下单（不打印）'),
+          ),
+        ],
       );
 
   @override
@@ -2091,6 +2903,10 @@ class _OrderEntryPageState extends State<OrderEntryPage> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
+          // 0. 用餐方式（堂食 / 打包）+ 堂食桌号（页面最顶端）
+          _buildDiningSelector(s),
+          SizedBox(height: 14 * s),
+
           // 1. 总金额（最上面）
           Container(
             padding: EdgeInsets.all(16 * s),
@@ -2255,6 +3071,9 @@ class _OrderEntryPageState extends State<OrderEntryPage> {
             padding: EdgeInsets.all(16 * s),
             child: Column(
               children: [
+                // 0. 用餐方式（堂食 / 打包）+ 堂食桌号（页面最顶端）
+                _buildDiningSelector(s),
+                SizedBox(height: 10 * s),
                 // 1. 总金额
                 Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
@@ -2482,6 +3301,10 @@ class _OrderEntryPageState extends State<OrderEntryPage> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
+          // 0. 用餐方式（堂食 / 打包）+ 堂食桌号（面板最顶端）
+          _buildDiningSelector(s),
+          SizedBox(height: 10 * s),
+
           // 1. 总金额
           Container(
             padding: EdgeInsets.all(12 * s),
@@ -2619,6 +3442,25 @@ class _OrderHistoryPageState extends State<OrderHistoryPage> {
 
   Future<void> _reprint(Order o) async {
     await SettingsStore.addLog('--- 历史订单重打：单号 ${o.orderNo} ---');
+    final choice = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('选择重新打印内容'),
+        content: Text('单号 ${o.orderNo} 选择打印格式：'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, 'cancel'), child: const Text('取消')),
+          OutlinedButton(
+              onPressed: () => Navigator.pop(ctx, 'kitchen'), child: const Text('补打厨房单')),
+          OutlinedButton(
+              onPressed: () => Navigator.pop(ctx, 'invoice'), child: const Text('补打发票')),
+          FilledButton(
+              onPressed: () => Navigator.pop(ctx, 'both'), child: const Text('都打印')),
+        ],
+      ),
+    );
+    if (choice == null || choice == 'cancel' || !mounted) return;
+
     try {
       // 未连接时自动重连一次
       if (!await ensureBluetoothConnected()) {
@@ -2635,14 +3477,28 @@ class _OrderHistoryPageState extends State<OrderHistoryPage> {
         return;
       }
       final settings = await loadReceiptSettings();
-      final chunks = buildEscPosBytesChunks(o, settings);
-      final ok = await sendEscPosBytesChunked(chunks);
-      if (ok == true && mounted) {
-        await SettingsStore.addLog('重打成功');
-        _showMsg('重新打印成功！');
-      } else if (mounted) {
-        await SettingsStore.addLog('重打失败，返回: $ok');
-        _showMsg('打印失败：${ok is String ? ok : '请检查打印机状态'}');
+      bool okInvoice = true;
+      bool okKitchen = true;
+      
+      if (choice == 'invoice' || choice == 'both') {
+        final chunks = buildEscPosBytesChunks(o, settings);
+        final r = await sendEscPosBytesChunked(chunks);
+        okInvoice = (r == true);
+      }
+      if (choice == 'kitchen' || choice == 'both') {
+        final chunks = buildKitchenEscPosBytesChunks(o, settings);
+        final r = await sendEscPosBytesChunked(chunks);
+        okKitchen = (r == true);
+      }
+
+      if (mounted) {
+        if (okInvoice && okKitchen) {
+          await SettingsStore.addLog('重打成功');
+          _showMsg('重新打印成功！');
+        } else {
+          await SettingsStore.addLog('重打失败：okInvoice=$okInvoice, okKitchen=$okKitchen');
+          _showMsg('打印失败，请检查打印机状态');
+        }
       }
     } catch (e) {
       await SettingsStore.addLog('重打异常: $e');
@@ -2738,13 +3594,85 @@ class _OrderHistoryPageState extends State<OrderHistoryPage> {
     return sb.toString();
   }
 
+  /// 删除历史订单前需输入授权密码（与解锁密码相同），验证通过才允许删除
+  Future<bool> _promptDeletePassword() async {
+    var passed = false;
+    await showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) {
+        final ctrl = TextEditingController();
+        String? error;
+        bool checkAndPop() {
+          if (ctrl.text.trim() == AuthService.appPassword) {
+            passed = true;
+            Navigator.pop(ctx);
+            return true;
+          }
+          return false;
+        }
+
+        return StatefulBuilder(
+          builder: (ctx, setDialogState) => AlertDialog(
+            title: const Text('删除历史订单'),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text('删除后无法恢复，请输入授权密码确认：'),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: ctrl,
+                  autofocus: true,
+                  obscureText: true,
+                  keyboardType: TextInputType.number,
+                  textInputAction: TextInputAction.done,
+                  onSubmitted: (_) {
+                    if (!checkAndPop()) {
+                      setDialogState(() => error = '密码错误，请重新输入');
+                      ctrl.clear();
+                    }
+                  },
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(fontSize: 20, letterSpacing: 4),
+                  decoration: InputDecoration(
+                    hintText: '请输入授权密码',
+                    errorText: error,
+                  ),
+                ),
+              ],
+            ),
+            actions: [
+              TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
+              FilledButton(
+                style: FilledButton.styleFrom(backgroundColor: Colors.red),
+                onPressed: () {
+                  if (!checkAndPop()) {
+                    setDialogState(() => error = '密码错误，请重新输入');
+                    ctrl.clear();
+                  }
+                },
+                child: const Text('确认删除'),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+    return passed;
+  }
+
   Future<void> _delete(int index) async {
+    if (!await _promptDeletePassword()) return;
+    if (!mounted) return;
+    final o = _orders[index];
     final prefs = await SharedPreferences.getInstance();
     final list = prefs.getStringList('orders') ?? [];
     if (index >= 0 && index < list.length) {
       list.removeAt(list.length - 1 - index);
       await prefs.setStringList('orders', list);
       setState(() => _orders.removeAt(index));
+      await SettingsStore.addLog('已删除历史订单：单号 ${o.orderNo}（授权密码验证通过）');
     }
   }
 
@@ -2823,6 +3751,382 @@ class _OrderHistoryPageState extends State<OrderHistoryPage> {
   }
 }
 
+// ==================== 备菜页面（勾选历史订单 → 打印厨房单 + 产品数量汇总）====================
+
+/// 备菜页：勾选多张历史单据，一键打印一张产品数量汇总小票，
+/// 统计每样产品的数量总计，方便后厨按总量备菜
+class PrepPage extends StatefulWidget {
+  const PrepPage({super.key, this.refreshSignal});
+
+  /// 切换到本页时由 MainScreen 自增，通知重新加载最新订单
+  final ValueNotifier<int>? refreshSignal;
+
+  @override
+  State<PrepPage> createState() => _PrepPageState();
+}
+
+class _PrepPageState extends State<PrepPage> {
+  List<Order> _orders = [];
+  final Set<String> _selectedIds = {};
+  bool _loading = false;
+  bool _printing = false;
+  bool _todayOnly = true; // 默认只显示今天日期的菜单
+  bool _plainOnlyFilter = false; // 只看无辣单（厨房可以先出）
+  String _currency = 'RM';
+
+  @override
+  void initState() {
+    super.initState();
+    widget.refreshSignal?.addListener(_onRefreshSignal);
+    _loadOrders();
+  }
+
+  @override
+  void dispose() {
+    widget.refreshSignal?.removeListener(_onRefreshSignal);
+    super.dispose();
+  }
+
+  void _onRefreshSignal() => _loadOrders();
+
+  Future<void> _loadOrders() async {
+    setState(() => _loading = true);
+    final prefs = await SharedPreferences.getInstance();
+    final list = prefs.getStringList('orders') ?? [];
+    var orders = list.reversed.map((s) => decodeOrder(s)).whereType<Order>().toList();
+    // 默认只看今天的菜单，可切换查看全部
+    if (_todayOnly) {
+      final now = DateTime.now();
+      orders = orders
+          .where((o) =>
+              o.time.year == now.year && o.time.month == now.month && o.time.day == now.day)
+          .toList();
+    }
+    // 只看无辣单：整单没有辣的，厨房不用多一道工序
+    if (_plainOnlyFilter) {
+      orders = orders.where((o) => o.isPlainOnly).toList();
+    }
+    final currency = await SettingsStore.getCurrency();
+    // 清掉已删除或不在当前列表中订单的勾选
+    final ids = orders.map((o) => o.id).toSet();
+    _selectedIds.removeWhere((id) => !ids.contains(id));
+    if (mounted) {
+      setState(() {
+        _orders = orders;
+        _currency = currency;
+        _loading = false;
+      });
+    }
+  }
+
+  bool get _allSelected => _orders.isNotEmpty && _selectedIds.length == _orders.length;
+
+  void _toggleAll() {
+    setState(() {
+      if (_allSelected) {
+        _selectedIds.clear();
+      } else {
+        _selectedIds.addAll(_orders.map((o) => o.id));
+      }
+    });
+  }
+
+  void _toggleOne(Order o) {
+    setState(() {
+      if (_selectedIds.contains(o.id)) {
+        _selectedIds.remove(o.id);
+      } else {
+        _selectedIds.add(o.id);
+      }
+    });
+  }
+
+  /// 汇总：品类 → 口味两级（和打印共用 aggregatePrep，保证屏幕与纸上一致）
+  List<PrepGroup> _aggregate(List<Order> orders) => aggregatePrep(orders);
+
+  /// 汇总面板里的胶囊文字
+  String _summaryLine(PrepGroup g) {
+    if (!g.byCategory) return '${g.name} ×${g.total}';
+    return '${g.name} 共${g.total}（不辣 ×${g.plainQty} / 辣 ×${g.spicyQty}）';
+  }
+
+  /// 打印已勾选订单的备菜汇总小票：每样产品数量总计（不逐单打印）
+  Future<void> _printSelected() async {
+    final selected = _orders.where((o) => _selectedIds.contains(o.id)).toList()
+      ..sort((a, b) => a.time.compareTo(b.time));
+    if (selected.isEmpty) {
+      _showMsg('请先勾选要打印的订单');
+      return;
+    }
+
+    setState(() => _printing = true);
+    var ok = true;
+    try {
+      // 未连接时自动重连一次
+      if (!await ensureBluetoothConnected()) {
+        await SettingsStore.addLog('备菜汇总打印：蓝牙未连接且自动重连失败');
+        ok = false;
+        if (mounted) {
+          showDialog(
+            context: context,
+            builder: (_) => AlertDialog(
+              title: const Text('蓝牙未连接'),
+              content: const Text('自动重连失败，请检查打印机是否已开机、蓝牙是否已配对'),
+              actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('确定'))],
+            ),
+          );
+        }
+        return;
+      }
+      final settings = await loadReceiptSettings();
+
+      await SettingsStore.addLog('--- 备菜汇总打印（${selected.length} 单）---');
+      final chunks = buildPrepSummaryEscPosBytesChunks(selected, settings);
+      final r = await sendEscPosBytesChunked(chunks);
+      ok = (r == true);
+
+      if (mounted) {
+        if (ok) {
+          await SettingsStore.addLog('备菜汇总打印成功（${selected.length} 单）');
+          // 打印成功后清空所有勾选
+          setState(() => _selectedIds.clear());
+          _showMsg('备菜汇总打印完成（${selected.length} 单）');
+        } else {
+          await SettingsStore.addLog('备菜汇总打印失败');
+          _showMsg('打印失败，请检查打印机状态');
+        }
+      }
+    } catch (e) {
+      await SettingsStore.addLog('备菜汇总打印异常: $e');
+      if (mounted) _showMsg('打印异常: $e');
+    } finally {
+      if (mounted) setState(() => _printing = false);
+    }
+  }
+
+  void _showMsg(String msg) {
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final isTablet = isTabletDevice(context);
+    final selectedOrders = _orders.where((o) => _selectedIds.contains(o.id)).toList();
+    final summary = _aggregate(selectedOrders);
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('备菜'),
+        actions: [
+          IconButton(
+            icon: Icon(_todayOnly ? Icons.today : Icons.calendar_month,
+                size: isTablet ? 32 : 24,
+                color: _todayOnly ? Theme.of(context).colorScheme.primary : null),
+            tooltip: _todayOnly ? '当前：仅今天订单，点击查看全部' : '当前：全部订单，点击仅看今天',
+            onPressed: () {
+              setState(() => _todayOnly = !_todayOnly);
+              _loadOrders();
+            },
+          ),
+          IconButton(
+            icon: Icon(_plainOnlyFilter ? Icons.filter_alt : Icons.filter_alt_outlined,
+                size: isTablet ? 32 : 24,
+                color: _plainOnlyFilter ? Colors.green : null),
+            tooltip: _plainOnlyFilter ? '当前：只看无辣单，点击显示全部' : '只看无辣单（可以先出）',
+            onPressed: () {
+              setState(() => _plainOnlyFilter = !_plainOnlyFilter);
+              _loadOrders();
+            },
+          ),
+          IconButton(
+            icon: Icon(_allSelected ? Icons.deselect : Icons.select_all, size: isTablet ? 32 : 24),
+            tooltip: _allSelected ? '取消全选' : '全选',
+            onPressed: _orders.isEmpty ? null : _toggleAll,
+          ),
+          IconButton(
+            icon: Icon(Icons.refresh, size: isTablet ? 32 : 24),
+            tooltip: '刷新',
+            onPressed: _loadOrders,
+          ),
+        ],
+      ),
+      body: _loading
+          ? const Center(child: CircularProgressIndicator())
+          : _orders.isEmpty
+              ? Center(
+                  child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
+                    Icon(Icons.inbox, size: isTablet ? 96 : 72, color: Colors.grey),
+                    SizedBox(height: isTablet ? 24 : 16),
+                    Text(_todayOnly ? '今天暂无订单' : '暂无历史订单',
+                        style: TextStyle(color: Colors.grey, fontSize: isTablet ? 22 : 18)),
+                  ]))
+              : Column(
+                  children: [
+                    Padding(
+                      padding: EdgeInsets.fromLTRB(isTablet ? 20 : 16, isTablet ? 12 : 8, isTablet ? 20 : 16, 0),
+                      child: Row(children: [
+                        Icon(Icons.touch_app, size: isTablet ? 20 : 16, color: Colors.grey),
+                        const SizedBox(width: 6),
+                        Expanded(
+                          child: Text('勾选单据后点打印，自动汇总每样产品数量',
+                              style: TextStyle(color: Colors.grey, fontSize: isTablet ? 16 : 12)),
+                        ),
+                      ]),
+                    ),
+                    Expanded(child: _buildOrderList(isTablet)),
+                    if (selectedOrders.isNotEmpty)
+                      _buildSummaryPanel(selectedOrders, summary, isTablet),
+                  ],
+                ),
+    );
+  }
+
+  Widget _buildOrderList(bool isTablet) {
+    return ListView.builder(
+      padding: EdgeInsets.all(isTablet ? 16 : 8),
+      itemCount: _orders.length,
+      itemBuilder: (context, index) {
+        final o = _orders[index];
+        final checked = _selectedIds.contains(o.id);
+        final itemsText = o.items.map((it) => '${it.name}x${it.quantity}').join('、');
+        return Card(
+          margin: EdgeInsets.only(bottom: isTablet ? 12 : 8),
+          child: InkWell(
+            borderRadius: BorderRadius.circular(12),
+            onTap: () => _toggleOne(o),
+            child: Padding(
+              padding: EdgeInsets.symmetric(
+                  horizontal: isTablet ? 16 : 8, vertical: isTablet ? 14 : 10),
+              child: Row(children: [
+                SizedBox(
+                  width: isTablet ? 40 : 32,
+                  height: isTablet ? 40 : 32,
+                  child: Checkbox(value: checked, onChanged: (_) => _toggleOne(o)),
+                ),
+                const SizedBox(width: 4),
+                Expanded(
+                  child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    Row(children: [
+                      Text('${o.diningPrefix}单号 ${o.orderNo}',
+                          style: TextStyle(
+                              fontSize: isTablet ? 22 : 17,
+                              fontWeight: FontWeight.bold)),
+                      const SizedBox(width: 8),
+                      // 无辣单标记：整单没辣，厨房不用多一道工序，可以先出
+                      Container(
+                        padding: EdgeInsets.symmetric(
+                            horizontal: isTablet ? 10 : 6, vertical: isTablet ? 3 : 1),
+                        decoration: BoxDecoration(
+                          color: o.isPlainOnly ? Colors.green[50] : Colors.red[50],
+                          borderRadius: BorderRadius.circular(999),
+                          border: Border.all(
+                              color: o.isPlainOnly ? Colors.green[300]! : Colors.red[300]!),
+                        ),
+                        child: Text(
+                          o.isPlainOnly ? '无辣 · 可先出' : '含辣',
+                          style: TextStyle(
+                              fontSize: isTablet ? 15 : 11,
+                              fontWeight: FontWeight.w600,
+                              color: o.isPlainOnly ? Colors.green[800] : Colors.red[800]),
+                        ),
+                      ),
+                      const Spacer(),
+                      Text(formatTime(o.time),
+                          style: TextStyle(color: Colors.grey, fontSize: isTablet ? 18 : 13)),
+                    ]),
+                    SizedBox(height: isTablet ? 6 : 4),
+                    Text(
+                      itemsText,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(fontSize: isTablet ? 18 : 13, color: Colors.blueGrey),
+                    ),
+                  ]),
+                ),
+              ]),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  /// 底部汇总面板：已选单数/总份数 + 每样产品数量总计（按数量降序） + 打印按钮
+  Widget _buildSummaryPanel(
+      List<Order> selectedOrders, List<PrepGroup> summary, bool isTablet) {
+    final totalPieces = summary.fold<int>(0, (s, g) => s + g.total);
+    return Container(
+      width: double.infinity,
+      decoration: BoxDecoration(
+        color: Colors.grey[100],
+        border: const Border(top: BorderSide(color: Colors.black12)),
+      ),
+      padding: EdgeInsets.fromLTRB(
+          isTablet ? 20 : 14, isTablet ? 14 : 10, isTablet ? 20 : 14, isTablet ? 12 : 8),
+      child: SafeArea(
+        top: false,
+        child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Row(children: [
+            Icon(Icons.restaurant_menu, size: isTablet ? 22 : 18, color: Colors.deepOrange),
+            const SizedBox(width: 6),
+            Expanded(
+              child: Text('备菜汇总：${selectedOrders.length} 单 · 共 $totalPieces 份 ($_currency${fmt(selectedOrders.fold<double>(0, (s, o) => s + o.total))})',
+                  style: TextStyle(fontSize: isTablet ? 20 : 15, fontWeight: FontWeight.bold)),
+            ),
+          ]),
+          SizedBox(height: isTablet ? 10 : 8),
+          ConstrainedBox(
+            constraints: BoxConstraints(maxHeight: isTablet ? 180 : 130),
+            child: SingleChildScrollView(
+              child: Wrap(
+                spacing: isTablet ? 10 : 8,
+                runSpacing: isTablet ? 10 : 8,
+                children: [
+                  for (final g in summary)
+                    Container(
+                      padding: EdgeInsets.symmetric(
+                          horizontal: isTablet ? 14 : 10, vertical: isTablet ? 8 : 5),
+                      decoration: BoxDecoration(
+                        color: Colors.deepOrange[50],
+                        borderRadius: BorderRadius.circular(999),
+                        border: Border.all(color: Colors.deepOrange[200]!),
+                      ),
+                      child: Text(
+                        _summaryLine(g),
+                        style: TextStyle(
+                            fontSize: isTablet ? 19 : 14,
+                            color: Colors.deepOrange[900],
+                            fontWeight: FontWeight.w600),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          ),
+          SizedBox(height: isTablet ? 12 : 10),
+          SizedBox(
+            width: double.infinity,
+            height: isTablet ? 64 : 52,
+            child: FilledButton.icon(
+              onPressed: _printing ? null : _printSelected,
+              icon: _printing
+                  ? SizedBox(
+                      width: isTablet ? 26 : 20,
+                      height: isTablet ? 26 : 20,
+                      child: const CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                  : Icon(Icons.print, size: isTablet ? 30 : 24),
+              label: Text(
+                _printing ? '打印中…' : '打印备菜汇总（${selectedOrders.length} 单）',
+                style: TextStyle(fontSize: isTablet ? 22 : 17, fontWeight: FontWeight.bold),
+              ),
+            ),
+          ),
+        ]),
+      ),
+    );
+  }
+}
+
 // ==================== 设置页面（菜单管理 + 外卖单号）====================
 
 class SettingsPage extends StatefulWidget {
@@ -2858,8 +4162,17 @@ class _SettingsPageState extends State<SettingsPage> {
   bool _tabletMode = false; // 平板模式开关
   List<String> _logs = []; // 打印调试日志
   String _qrBase64 = ''; // 付款二维码 base64 PNG
+  String _logoBase64 = ''; // 招牌图片 base64 PNG
+  bool _logoPrintEnabled = true; // 是否打印招牌图片
+  int _logoPrintSize = 1; // 招牌图片打印大小：0=小 1=中 2=大
+  bool _showName = true; // 是否在小票显示店铺名称
+  bool _showSubtitle = true; // 是否在小票显示副标题（与店名独立）
+  int _qrPrintSize = 0; // 二维码打印大小：0=自动 160=小 240=中 320=大
   int _remainingDays = 30; // 授权剩余天数
-  bool _addSpicy = false; // 新添加菜品是否支持辣度选择
+  List<TagDef> _tags = []; // 标签库（品类 + 口味）
+  List<String> _tableNos = []; // 桌号列表（堂食点单时下拉选择）
+  String _addCatTag = ''; // 新增菜品时选中的品类标签
+  String _addFlavorTag = ''; // 新增菜品时选中的口味标签
 
   String get _currency => _currencyCtrl.text.trim().isEmpty ? 'RM' : _currencyCtrl.text.trim();
 
@@ -2871,6 +4184,8 @@ class _SettingsPageState extends State<SettingsPage> {
 
   Future<void> _load() async {
     final menu = await SettingsStore.loadMenu();
+    final tags = await SettingsStore.loadTags();
+    final tableNos = await SettingsStore.getTableNos();
     final next = await SettingsStore.getCurrentNo();
     final start = await SettingsStore.getStartNo();
     final days = await AuthService.getRemainingDays();
@@ -2893,12 +4208,26 @@ class _SettingsPageState extends State<SettingsPage> {
     _tabletMode = await SettingsStore.getTabletMode();
     _logs = await SettingsStore.loadLogs();
     _qrBase64 = await SettingsStore.getPaymentQr();
+    final logoBase64 = await SettingsStore.getLogoBase64();
+    final logoPrintEnabled = await SettingsStore.getLogoPrintEnabled();
+    final logoPrintSize = await SettingsStore.getLogoPrintSize();
+    final showName = await SettingsStore.getShowName();
+    final showSubtitle = await SettingsStore.getShowSubtitle();
+    final qrPrintSize = await SettingsStore.getQrPrintSize();
     if (mounted) {
       setState(() {
         _menu = menu;
+        _tags = tags;
+        _tableNos = tableNos;
         _nextNo = next;
         _startNoCtrl.text = '$start';
         _remainingDays = days;
+        _logoBase64 = logoBase64;
+        _logoPrintEnabled = logoPrintEnabled;
+        _logoPrintSize = logoPrintSize;
+        _showName = showName;
+        _showSubtitle = showSubtitle;
+        _qrPrintSize = qrPrintSize;
       });
     }
   }
@@ -2911,8 +4240,14 @@ class _SettingsPageState extends State<SettingsPage> {
       return;
     }
     setState(() {
-      _menu.add(MenuItem(name: name, price: price, spicyEnabled: _addSpicy));
-      _addSpicy = false;
+      _menu.add(MenuItem(
+        name: name,
+        price: price,
+        catTag: _addCatTag,
+        flavorTag: _addFlavorTag,
+      ));
+      _addCatTag = '';
+      _addFlavorTag = '';
     });
     _nameCtrl.clear();
     _priceCtrl.clear();
@@ -2925,38 +4260,46 @@ class _SettingsPageState extends State<SettingsPage> {
     final m = _menu[idx];
     final nCtrl = TextEditingController(text: m.name);
     final pCtrl = TextEditingController(text: '${m.price}');
-    bool editSpicy = m.spicyEnabled;
+    var editCat = m.catTag;
+    var editFlavor = m.flavorTag;
     final action = await showDialog<String>(
       context: context,
       builder: (ctx) => StatefulBuilder(
         builder: (ctx, setDialogState) => AlertDialog(
           title: const Text('编辑菜单'),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              TextField(
-                  controller: nCtrl,
-                  style: const TextStyle(fontSize: 18),
-                  decoration: const InputDecoration(labelText: '菜品名称')),
-              const SizedBox(height: 8),
-              TextField(
-                  controller: pCtrl,
-                  keyboardType: const TextInputType.numberWithOptions(decimal: true),
-                  style: const TextStyle(fontSize: 18),
-                  decoration: InputDecoration(labelText: '单价（$_currency）')),
-              const SizedBox(height: 8),
-              CheckboxListTile(
-                contentPadding: EdgeInsets.zero,
-                title: const Row(
-                  children: [
-                    Text('🌶 ', style: TextStyle(fontSize: 18)),
-                    Text('支持辣度选择 (辣/不辣)', style: TextStyle(fontSize: 15)),
-                  ],
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextField(
+                    controller: nCtrl,
+                    style: const TextStyle(fontSize: 18),
+                    decoration: const InputDecoration(labelText: '菜品名称')),
+                const SizedBox(height: 8),
+                TextField(
+                    controller: pCtrl,
+                    keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                    style: const TextStyle(fontSize: 18),
+                    decoration: InputDecoration(labelText: '单价（$_currency）')),
+                const SizedBox(height: 8),
+                _tagPickerTile(
+                  label: '品类标签（用于合并统计）',
+                  value: editCat,
+                  type: 'cat',
+                  onPicked: (v) {
+                    if (ctx.mounted) setDialogState(() => editCat = v);
+                  },
                 ),
-                value: editSpicy,
-                onChanged: (v) => setDialogState(() => editSpicy = v ?? false),
-              ),
-            ],
+                _tagPickerTile(
+                  label: '口味标签（用于区分辣/不辣）',
+                  value: editFlavor,
+                  type: 'flavor',
+                  onPicked: (v) {
+                    if (ctx.mounted) setDialogState(() => editFlavor = v);
+                  },
+                ),
+              ],
+            ),
           ),
           actions: [
             TextButton(
@@ -2979,10 +4322,359 @@ class _SettingsPageState extends State<SettingsPage> {
         if (mounted) _showMsg('名称或价格不正确');
         return;
       }
-      setState(() => _menu[idx] = MenuItem(name: name, price: price, spicyEnabled: editSpicy));
+      setState(() => _menu[idx] = MenuItem(
+            name: name,
+            price: price,
+            spicyEnabled: m.spicyEnabled,
+            catTag: editCat,
+            flavorTag: editFlavor,
+          ));
       await SettingsStore.saveMenu(_menu);
       if (mounted) _showMsg('已保存');
     }
+  }
+
+  // ==================== 标签管理（品类 / 口味）====================
+
+  /// 新建 / 编辑一个标签；返回保存后的标签（取消返回 null）
+  Future<TagDef?> _tagEditor({TagDef? origin, String defaultType = 'cat'}) async {
+    final nCtrl = TextEditingController(text: origin?.name ?? '');
+    var type = origin?.type ?? defaultType;
+    var isSpicy = origin?.isSpicy ?? false;
+    bool dup() {
+      final n = nCtrl.text.trim();
+      return n.isNotEmpty &&
+          _tags.any((t) => t.name == n && t.name != (origin?.name ?? ''));
+    }
+
+    final result = await showDialog<TagDef>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDlg) => AlertDialog(
+          title: Text(origin == null ? '新增标签' : '编辑标签'),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                TextField(
+                  controller: nCtrl,
+                  autofocus: true,
+                  style: const TextStyle(fontSize: 18),
+                  decoration:
+                      const InputDecoration(labelText: '标签名称（如 鸡架 / 原味 / 辣味）'),
+                  onChanged: (_) => setDlg(() {}),
+                ),
+                const SizedBox(height: 14),
+                const Text('类型', style: TextStyle(fontSize: 14, color: Colors.grey)),
+                const SizedBox(height: 6),
+                Wrap(
+                  spacing: 8,
+                  children: [
+                    ChoiceChip(
+                      label: const Text('品类'),
+                      selected: type == 'cat',
+                      onSelected: (_) => setDlg(() => type = 'cat'),
+                    ),
+                    ChoiceChip(
+                      label: const Text('口味'),
+                      selected: type == 'flavor',
+                      onSelected: (_) => setDlg(() => type = 'flavor'),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  type == 'cat'
+                      ? '品类：把多个菜品合并成同一款产品统计（例如"鸡架"）'
+                      : '口味：在品类内部再细分（例如"原味""辣味"）',
+                  style: const TextStyle(fontSize: 12, color: Colors.grey),
+                ),
+                if (type == 'flavor')
+                  CheckboxListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('这个口味带辣（厨房要多一道工序）',
+                        style: TextStyle(fontSize: 15)),
+                    value: isSpicy,
+                    onChanged: (v) => setDlg(() => isSpicy = v ?? false),
+                  ),
+                if (dup())
+                  const Padding(
+                    padding: EdgeInsets.only(top: 6),
+                    child: Text('已有同名标签',
+                        style: TextStyle(fontSize: 13, color: Colors.red)),
+                  ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
+            FilledButton(
+              onPressed: () {
+                final name = nCtrl.text.trim();
+                if (name.isEmpty || dup()) return;
+                Navigator.pop(
+                    ctx,
+                    TagDef(
+                      name: name,
+                      type: type,
+                      isSpicy: type == 'flavor' ? isSpicy : false,
+                    ));
+              },
+              child: const Text('保存'),
+            ),
+          ],
+        ),
+      ),
+    );
+
+    if (result == null) return null;
+
+    setState(() {
+      if (origin == null) {
+        _tags.add(result);
+      } else {
+        final idx = _tags.indexOf(origin);
+        if (idx >= 0) _tags[idx] = result;
+        // 标签改名时同步更新菜单，避免菜单指向一个不存在的标签
+        if (origin.name != result.name) _renameTagOnMenu(origin.name, result.name);
+      }
+    });
+    await SettingsStore.saveTags(_tags);
+    if (origin != null && origin.name != result.name) {
+      await SettingsStore.saveMenu(_menu);
+    }
+    if (mounted) _showMsg(origin == null ? '已新增标签：${result.name}' : '标签已保存');
+    return result;
+  }
+
+  /// 标签改名后，把菜单上引用旧名字的地方换成新名字
+  void _renameTagOnMenu(String oldName, String newName) {
+    for (var i = 0; i < _menu.length; i++) {
+      final m = _menu[i];
+      final newCat = m.catTag == oldName ? newName : m.catTag;
+      final newFlavor = m.flavorTag == oldName ? newName : m.flavorTag;
+      if (newCat != m.catTag || newFlavor != m.flavorTag) {
+        _menu[i] = MenuItem(
+          name: m.name,
+          price: m.price,
+          spicyEnabled: m.spicyEnabled,
+          catTag: newCat,
+          flavorTag: newFlavor,
+        );
+      }
+    }
+  }
+
+  /// 删除标签；引用它的菜品会自动清空这个标签
+  Future<void> _deleteTag(TagDef t) async {
+    final usedCount =
+        _menu.where((m) => m.catTag == t.name || m.flavorTag == t.name).length;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('删除标签「${t.name}」'),
+        content: Text(usedCount > 0
+            ? '有 $usedCount 个菜品正在用这个标签，删除后它们的这个标签会被清空。'
+            : '确定删除这个标签吗？'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('取消')),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: Colors.red),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('删除'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true) return;
+
+    setState(() {
+      _tags.remove(t);
+      for (var i = 0; i < _menu.length; i++) {
+        final m = _menu[i];
+        if (m.catTag == t.name || m.flavorTag == t.name) {
+          _menu[i] = MenuItem(
+            name: m.name,
+            price: m.price,
+            spicyEnabled: m.spicyEnabled,
+            catTag: m.catTag == t.name ? '' : m.catTag,
+            flavorTag: m.flavorTag == t.name ? '' : m.flavorTag,
+          );
+        }
+      }
+    });
+    await SettingsStore.saveTags(_tags);
+    await SettingsStore.saveMenu(_menu);
+    if (mounted) _showMsg('已删除标签：${t.name}');
+  }
+
+  // ==================== 桌号管理（堂食点单时下拉选择）====================
+
+  /// 新增 / 修改桌号；origin=null 表示新增，否则为原桌号（改名）
+  Future<void> _tableNoEditor({String? origin}) async {
+    final ctrl = TextEditingController(text: origin ?? '');
+    final name = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(origin == null ? '新增桌号' : '修改桌号'),
+        content: TextField(
+          controller: ctrl,
+          autofocus: true,
+          style: const TextStyle(fontSize: 18),
+          decoration: const InputDecoration(labelText: '桌号', hintText: '如 65 或 A1'),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
+          FilledButton(
+              onPressed: () => Navigator.pop(ctx, ctrl.text.trim()),
+              child: const Text('保存')),
+        ],
+      ),
+    );
+    if (name == null) return;
+    if (name.isEmpty) {
+      if (mounted) _showMsg('桌号不能为空');
+      return;
+    }
+    // 重名检查（改名时排除自己）
+    if (_tableNos.any((t) => t == name && t != origin)) {
+      if (mounted) _showMsg('桌号「$name」已存在');
+      return;
+    }
+    if (origin != null && name == origin) return; // 没改
+    setState(() {
+      if (origin == null) {
+        _tableNos.add(name);
+      } else {
+        final idx = _tableNos.indexOf(origin);
+        if (idx >= 0) _tableNos[idx] = name;
+      }
+    });
+    await SettingsStore.setTableNos(_tableNos);
+    if (mounted) _showMsg(origin == null ? '已新增桌号：$name' : '桌号已改为：$name');
+  }
+
+  /// 删除桌号
+  Future<void> _deleteTableNo(String t) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('删除桌号「$t」'),
+        content: const Text('删除后新建订单的桌号下拉框里不再显示（不影响已下订单）。'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('取消')),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: Colors.red),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('删除'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    setState(() => _tableNos.remove(t));
+    await SettingsStore.setTableNos(_tableNos);
+    if (mounted) _showMsg('已删除桌号：$t');
+  }
+
+  /// 选择标签；返回 null=取消，''=不设置，其它=选中的标签名
+  Future<String?> _pickTag(String current, String type) async {
+    while (true) {
+      final names = type == 'cat'
+          ? SettingsStore.catTagNames(_tags)
+          : SettingsStore.flavorTagNames(_tags);
+      final picked = await showDialog<String>(
+        context: context,
+        builder: (ctx) => SimpleDialog(
+          title: Text(type == 'cat' ? '选择品类标签' : '选择口味标签'),
+          children: [
+            if (names.isEmpty)
+              const Padding(
+                padding: EdgeInsets.fromLTRB(24, 4, 24, 12),
+                child: Text('还没有标签，先新建一个',
+                    style: TextStyle(fontSize: 14, color: Colors.grey)),
+              ),
+            for (final name in names)
+              SimpleDialogOption(
+                onPressed: () => Navigator.pop(ctx, name),
+                child: Row(
+                  children: [
+                    SizedBox(
+                      width: 22,
+                      child: name == current
+                          ? const Icon(Icons.check, size: 18, color: Colors.green)
+                          : null,
+                    ),
+                    Text(name, style: const TextStyle(fontSize: 16)),
+                    if (type == 'flavor' && SettingsStore.isSpicyFlavor(_tags, name))
+                      const Padding(
+                        padding: EdgeInsets.only(left: 6),
+                        child: Text('🌶', style: TextStyle(fontSize: 14)),
+                      ),
+                  ],
+                ),
+              ),
+            const Divider(height: 8),
+            SimpleDialogOption(
+              onPressed: () => Navigator.pop(ctx, '__new__'),
+              child: Text('+ 新建${type == 'cat' ? '品类' : '口味'}标签',
+                  style: const TextStyle(fontSize: 16, color: Colors.blue)),
+            ),
+            SimpleDialogOption(
+              onPressed: () => Navigator.pop(ctx, ''),
+              child: const Text('不设置', style: TextStyle(fontSize: 16, color: Colors.grey)),
+            ),
+          ],
+        ),
+      );
+      if (picked == null) return null;
+      if (picked != '__new__') return picked;
+      final nt = await _tagEditor(defaultType: type);
+      if (nt != null) return nt.name;
+      // 取消新建 → 回到选择列表
+    }
+  }
+
+  /// 菜单列表副标题的标签文字，如 "  ·  鸡架 / 辣味 🌶"
+  String _menuTagLabel(MenuItem m) {
+    final parts = <String>[];
+    if (m.catTag.isNotEmpty) parts.add(m.catTag);
+    if (m.flavorTag.isNotEmpty) {
+      parts.add(SettingsStore.isSpicyFlavor(_tags, m.flavorTag)
+          ? '${m.flavorTag} 🌶'
+          : m.flavorTag);
+    }
+    if (parts.isEmpty) return '';
+    return '  ·  ${parts.join(' / ')}';
+  }
+
+  /// 一行"点击选择标签"的控件（菜单表单里用）
+  Widget _tagPickerTile({
+    required String label,
+    required String value,
+    required String type,
+    required ValueChanged<String> onPicked,
+  }) {
+    final spicy = type == 'flavor' && SettingsStore.isSpicyFlavor(_tags, value);
+    return ListTile(
+      contentPadding: EdgeInsets.zero,
+      dense: true,
+      title: Text(label, style: const TextStyle(fontSize: 13, color: Colors.grey)),
+      subtitle: Text(
+        value.isEmpty ? '未设置（点击选择）' : (spicy ? '$value 🌶' : value),
+        style: TextStyle(
+          fontSize: 16,
+          color: value.isEmpty ? Colors.grey : Colors.black87,
+          fontWeight: value.isEmpty ? FontWeight.normal : FontWeight.w600,
+        ),
+      ),
+      trailing: const Icon(Icons.arrow_drop_down),
+      onTap: () async {
+        final v = await _pickTag(value, type);
+        if (v != null) onPicked(v);
+      },
+    );
   }
 
   /// 刷新打印调试日志
@@ -3070,6 +4762,41 @@ class _SettingsPageState extends State<SettingsPage> {
     if (mounted) {
       setState(() => _qrBase64 = '');
       _showMsg('二维码已清除');
+    }
+  }
+
+  /// 从相册选取招牌图片
+  Future<void> _pickLogoImage() async {
+    final picker = ImagePicker();
+    final XFile? file = await picker.pickImage(source: ImageSource.gallery);
+    if (file == null || !mounted) return;
+    try {
+      final bytes = await file.readAsBytes();
+      // 压缩到 512px 宽以内（保持体积）
+      final decoded = img.decodeImage(bytes);
+      if (decoded == null) {
+        if (mounted) _showMsg('无法识别图片，请选择 PNG/JPG 格式');
+        return;
+      }
+      final scaled = img.copyResize(decoded, width: 512, interpolation: img.Interpolation.nearest);
+      final compressed = img.encodePng(scaled);
+      final base64 = 'data:image/png;base64,${base64Encode(compressed)}';
+      await SettingsStore.setLogoBase64(base64);
+      if (mounted) {
+        setState(() => _logoBase64 = base64);
+        _showMsg('招牌图片已更新');
+      }
+    } catch (e) {
+      if (mounted) _showMsg('选择图片失败：$e');
+    }
+  }
+
+  /// 清除已上传的招牌图片
+  Future<void> _clearLogo() async {
+    await SettingsStore.setLogoBase64('');
+    if (mounted) {
+      setState(() => _logoBase64 = '');
+      _showMsg('招牌图片已清除');
     }
   }
 
@@ -3197,7 +4924,7 @@ class _SettingsPageState extends State<SettingsPage> {
                     ),
                     const SizedBox(height: 10),
                     const Text(
-                      '软件采用 30 天周期安全验证，首次及到期时需输入密码（0818）方可继续使用。',
+                      '软件采用 30 天周期安全验证，首次及到期时需输入授权密码方可继续使用。',
                       style: TextStyle(fontSize: 13, color: Colors.grey, height: 1.4),
                     ),
                     const SizedBox(height: 12),
@@ -3211,7 +4938,7 @@ class _SettingsPageState extends State<SettingsPage> {
                           context: context,
                           builder: (ctx) => AlertDialog(
                             title: const Text('锁定软件'),
-                            content: const Text('锁定后将立即弹出密码输入界面，需要重新输入密码 0818 才能进入。确定锁定吗？'),
+                            content: const Text('锁定后将立即弹出密码输入界面，需要重新输入授权密码才能进入。确定锁定吗？'),
                             actions: [
                               TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('取消')),
                               ElevatedButton(
@@ -3322,9 +5049,67 @@ class _SettingsPageState extends State<SettingsPage> {
                 ),
               ),
             ),
+            const SizedBox(height: 8),
+            // 勾选隐藏店铺名称（发票和厨房单均不显示店名）
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 12.0),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    const Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text('在小票上显示店铺名称', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w500)),
+                        SizedBox(height: 4),
+                        Text('关闭后发票与厨房单均不打印店名',
+                            style: TextStyle(fontSize: 13, color: Colors.grey)),
+                      ],
+                    ),
+                    Switch(
+                      value: _showName,
+                      onChanged: (v) async {
+                        await SettingsStore.setShowName(v);
+                        if (mounted) setState(() => _showName = v);
+                        _showMsg(v ? '已显示店铺名称' : '已隐藏店铺名称');
+                      },
+                      activeColor: Colors.blueGrey[700],
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 8),
+            // 勾选隐藏副标题（与店名独立，关闭店名不影响副标题）
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 12.0),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    const Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text('在小票上显示副标题', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w500)),
+                        SizedBox(height: 4),
+                        Text('关闭后发票与厨房单均不打印副标题 1 & 2',
+                            style: TextStyle(fontSize: 13, color: Colors.grey)),
+                      ],
+                    ),
+                    Switch(
+                      value: _showSubtitle,
+                      onChanged: (v) async {
+                        await SettingsStore.setShowSubtitle(v);
+                        if (mounted) setState(() => _showSubtitle = v);
+                        _showMsg(v ? '已显示副标题' : '已隐藏副标题');
+                      },
+                      activeColor: Colors.blueGrey[700],
+                    ),
+                  ],
+                ),
+              ),
+            ),
             const SizedBox(height: 16),
-
-            // ===== 小票样式设置 =====
             const Text('小票样式', style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold)),
             const SizedBox(height: 8),
             Card(
@@ -3414,6 +5199,94 @@ class _SettingsPageState extends State<SettingsPage> {
                       ],
                     ),
                     const SizedBox(height: 12),
+                    // 招牌图片设置
+                    const Text('招牌图片（打印在小票顶部）',
+                        style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
+                    const SizedBox(height: 6),
+                    CheckboxListTile(
+                      contentPadding: EdgeInsets.zero,
+                      title: const Text('打印小票时显示招牌图片', style: TextStyle(fontSize: 14)),
+                      value: _logoPrintEnabled,
+                      onChanged: (v) async {
+                        if (v != null) {
+                          await SettingsStore.setLogoPrintEnabled(v);
+                          setState(() => _logoPrintEnabled = v);
+                          _showMsg(v ? '已启用招牌图片打印' : '已禁用招牌图片打印');
+                        }
+                      },
+                    ),
+                    if (_logoPrintEnabled) ...[
+                      Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 4),
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            const Text('招牌打印大小', style: TextStyle(fontSize: 14)),
+                            DropdownButton<int>(
+                              value: _logoPrintSize,
+                              items: const [
+                                DropdownMenuItem(value: 0, child: Text('小')),
+                                DropdownMenuItem(value: 1, child: Text('中')),
+                                DropdownMenuItem(value: 2, child: Text('大')),
+                              ],
+                              onChanged: (v) async {
+                                if (v != null) {
+                                  await SettingsStore.setLogoPrintSize(v);
+                                  setState(() => _logoPrintSize = v);
+                                  _showMsg('招牌打印大小已更新');
+                                }
+                              },
+                            ),
+                          ],
+                        ),
+                      ),
+                      const SizedBox(height: 6),
+                      if (_logoBase64.isNotEmpty)
+                        Stack(
+                          clipBehavior: Clip.none,
+                          children: [
+                            Container(
+                              width: double.infinity,
+                              padding: const EdgeInsets.all(8),
+                              decoration: BoxDecoration(
+                                border: Border.all(color: Colors.blueGrey.shade300),
+                                borderRadius: BorderRadius.circular(8),
+                              ),
+                              child: Image.memory(
+                                base64Decode(_logoBase64.split(',').skip(1).join(',')),
+                                height: 100,
+                                fit: BoxFit.contain,
+                              ),
+                            ),
+                            Positioned(
+                              top: -4,
+                              right: -4,
+                              child: IconButton(
+                                icon: const CircleAvatar(
+                                  radius: 12,
+                                  backgroundColor: Colors.red,
+                                  child: Icon(Icons.close, size: 14, color: Colors.white),
+                                ),
+                                padding: EdgeInsets.zero,
+                                constraints: const BoxConstraints(),
+                                onPressed: _clearLogo,
+                                tooltip: '清除招牌图片',
+                              ),
+                            ),
+                          ],
+                        )
+                      else
+                        OutlinedButton.icon(
+                          onPressed: _pickLogoImage,
+                          icon: const Icon(Icons.image_outlined),
+                          label: const Text('上传招牌图片'),
+                          style: OutlinedButton.styleFrom(
+                            minimumSize: const Size.fromHeight(48),
+                            textStyle: const TextStyle(fontSize: 14),
+                          ),
+                        ),
+                      const SizedBox(height: 12),
+                    ],
                     // 付款二维码（上传后打印在单号下方，含"QR Payment"标签）
                     const Text('付款二维码',
                         style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
@@ -3462,6 +5335,32 @@ class _SettingsPageState extends State<SettingsPage> {
                           textStyle: const TextStyle(fontSize: 14),
                         ),
                       ),
+                    const SizedBox(height: 8),
+                    Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 4),
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          const Text('二维码打印大小', style: TextStyle(fontSize: 14)),
+                          DropdownButton<int>(
+                            value: _qrPrintSize,
+                            items: const [
+                              DropdownMenuItem(value: 0, child: Text('自动（中）')),
+                              DropdownMenuItem(value: 160, child: Text('小')),
+                              DropdownMenuItem(value: 240, child: Text('中')),
+                              DropdownMenuItem(value: 320, child: Text('大')),
+                            ],
+                            onChanged: (v) async {
+                              if (v != null) {
+                                await SettingsStore.setQrPrintSize(v);
+                                if (mounted) setState(() => _qrPrintSize = v);
+                                _showMsg('二维码打印大小已更新');
+                              }
+                            },
+                          ),
+                        ],
+                      ),
+                    ),
                     const SizedBox(height: 12),
                     // 字号设置
                     _fontRow('标题字号', _titleFont, (v) async {
@@ -3546,6 +5445,108 @@ class _SettingsPageState extends State<SettingsPage> {
             ),
             const SizedBox(height: 20),
 
+            // ===== 标签管理（品类 / 口味）=====
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                const Text('标签管理',
+                    style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold)),
+                TextButton.icon(
+                  onPressed: () => _tagEditor(),
+                  icon: const Icon(Icons.add, size: 18),
+                  label: const Text('新建标签'),
+                ),
+              ],
+            ),
+            const SizedBox(height: 4),
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    if (_tags.isEmpty)
+                      const Text(
+                        '还没有标签。先建「鸡架」这样的品类标签，再建「原味」「辣味」口味标签，'
+                        '然后给下面的菜品选上。',
+                        style: TextStyle(fontSize: 13, color: Colors.grey),
+                      )
+                    else ...[
+                      Wrap(
+                        spacing: 8,
+                        runSpacing: 8,
+                        children: [
+                          for (final t in _tags)
+                            InputChip(
+                              label: Text(t.isCat
+                                  ? '${t.name}（品类）'
+                                  : (t.isSpicy ? '${t.name} 🌶' : t.name)),
+                              onPressed: () => _tagEditor(origin: t),
+                              onDeleted: () => _deleteTag(t),
+                              deleteIcon: const Icon(Icons.close, size: 16),
+                            ),
+                        ],
+                      ),
+                      const SizedBox(height: 8),
+                      const Text('点标签可改名 / 改类型，× 删除',
+                          style: TextStyle(fontSize: 12, color: Colors.grey)),
+                    ],
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 20),
+
+            // ===== 桌号管理（堂食点单时下拉选择）=====
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                const Text('桌号管理',
+                    style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold)),
+                TextButton.icon(
+                  onPressed: () => _tableNoEditor(),
+                  icon: const Icon(Icons.add, size: 18),
+                  label: const Text('新增桌号'),
+                ),
+              ],
+            ),
+            const SizedBox(height: 4),
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    if (_tableNos.isEmpty)
+                      const Text(
+                        '还没有桌号。新增后，新建订单选「堂食」时会出现在桌号下拉框里，'
+                        '打印的小票顶部会显示「堂食(Table:桌号)」。',
+                        style: TextStyle(fontSize: 13, color: Colors.grey),
+                      )
+                    else ...[
+                      Wrap(
+                        spacing: 8,
+                        runSpacing: 8,
+                        children: [
+                          for (final t in _tableNos)
+                            InputChip(
+                              label: Text('$t 号桌'),
+                              onPressed: () => _tableNoEditor(origin: t),
+                              onDeleted: () => _deleteTableNo(t),
+                              deleteIcon: const Icon(Icons.close, size: 16),
+                            ),
+                        ],
+                      ),
+                      const SizedBox(height: 8),
+                      const Text('点桌号可改名 / 修改，× 删除',
+                          style: TextStyle(fontSize: 12, color: Colors.grey)),
+                    ],
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 20),
+
             // ===== 菜单管理 =====
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
@@ -3570,7 +5571,7 @@ class _SettingsPageState extends State<SettingsPage> {
                   child: ListTile(
                     title: Row(
                       children: [
-                        if (m.spicyEnabled)
+                        if (SettingsStore.isSpicyFlavor(_tags, m.flavorTag))
                           const Padding(
                             padding: EdgeInsets.only(right: 6),
                             child: Text('🌶', style: TextStyle(fontSize: 16)),
@@ -3581,7 +5582,7 @@ class _SettingsPageState extends State<SettingsPage> {
                       ],
                     ),
                     subtitle: Text(
-                      '${fmt(m.price)} $_currency${m.spicyEnabled ? '  · 可选辣度' : ''}',
+                      '${fmt(m.price)} $_currency${_menuTagLabel(m)}',
                       style: const TextStyle(fontSize: 13, color: Colors.grey),
                     ),
                     trailing: IconButton(
@@ -3625,16 +5626,17 @@ class _SettingsPageState extends State<SettingsPage> {
                       ],
                     ),
                     const SizedBox(height: 4),
-                    CheckboxListTile(
-                      contentPadding: EdgeInsets.zero,
-                      title: const Row(
-                        children: [
-                          Text('🌶 ', style: TextStyle(fontSize: 16)),
-                          Text('支持辣度选择 (辣/不辣)', style: TextStyle(fontSize: 14)),
-                        ],
-                      ),
-                      value: _addSpicy,
-                      onChanged: (v) => setState(() => _addSpicy = v ?? false),
+                    _tagPickerTile(
+                      label: '品类标签（用于合并统计）',
+                      value: _addCatTag,
+                      type: 'cat',
+                      onPicked: (v) => setState(() => _addCatTag = v),
+                    ),
+                    _tagPickerTile(
+                      label: '口味标签（用于区分辣/不辣）',
+                      value: _addFlavorTag,
+                      type: 'flavor',
+                      onPicked: (v) => setState(() => _addFlavorTag = v),
                     ),
                   ],
                 ),
