@@ -2663,6 +2663,77 @@ class _OrderEntryPageState extends State<OrderEntryPage> {
     setState(() => _items.removeAt(idx));
   }
 
+  /// 长按拖动调整菜品（菜单）顺序，改完立即写入本地 —— 下次打开依然是这个顺序。
+  Future<void> _reorderMenu(int oldIndex, int newIndex) async {
+    setState(() {
+      if (newIndex > oldIndex) newIndex -= 1;
+      final m = _menu.removeAt(oldIndex);
+      _menu.insert(newIndex, m);
+    });
+    await SettingsStore.saveMenu(_menu);
+  }
+
+  /// 平板网格无法直接拖拽，长按菜品弹出可拖动的排序列表（确认后保存）
+  Future<void> _openMenuReorderDialog() async {
+    if (_menu.isEmpty) return;
+    final backup = List<MenuItem>.from(_menu);
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDialogState) => AlertDialog(
+          title: const Text('调整菜品顺序'),
+          content: SizedBox(
+            width: 420,
+            height: 420,
+            child: ReorderableListView.builder(
+              buildDefaultDragHandles: false,
+              itemCount: _menu.length,
+              onReorder: (o, n) => setDialogState(() {
+                if (n > o) n -= 1;
+                _menu.insert(n, _menu.removeAt(o));
+              }),
+              itemBuilder: (context, i) {
+                final m = _menu[i];
+                return ReorderableDelayedDragStartListener(
+                  key: ObjectKey(m),
+                  index: i,
+                  child: ListTile(
+                    dense: true,
+                    leading: CircleAvatar(
+                      radius: 14,
+                      child: Text('${i + 1}', style: const TextStyle(fontSize: 13)),
+                    ),
+                    title: Text(m.name, style: const TextStyle(fontSize: 16)),
+                    subtitle: Text('${fmt(m.price)} $_currency',
+                        style: const TextStyle(fontSize: 12)),
+                    trailing: const Icon(Icons.drag_handle, size: 20),
+                  ),
+                );
+              },
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () {
+                setState(() => _menu..clear()..addAll(backup)); // 取消→还原
+                Navigator.pop(ctx);
+              },
+              child: const Text('取消'),
+            ),
+            FilledButton(
+              onPressed: () async {
+                await SettingsStore.saveMenu(_menu);
+                if (ctx.mounted) Navigator.pop(ctx);
+                if (mounted) _showMsg('菜品顺序已保存');
+              },
+              child: const Text('保存'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   Future<void> _saveAndPrint() async {
     await SettingsStore.addLog('--- 新建订单打印开始 ---');
     if (_items.isEmpty) {
@@ -2933,9 +3004,14 @@ class _OrderEntryPageState extends State<OrderEntryPage> {
           ),
           SizedBox(height: 20 * s),
 
-          // 3. 菜单选择
-          Text('选择菜品（点菜单项可直接输入数量）',
-              style: TextStyle(fontSize: 15 * s, fontWeight: FontWeight.bold)),
+          // 3. 菜单选择（长按菜品可拖动排序，顺序会记住）
+          Row(children: [
+            Expanded(
+              child: Text('选择菜品（点菜单项可直接输入数量）',
+                  style: TextStyle(fontSize: 15 * s, fontWeight: FontWeight.bold)),
+            ),
+            Text('长按可排序', style: TextStyle(fontSize: 12 * s, color: Colors.grey)),
+          ]),
           SizedBox(height: 8 * s),
           if (_menu.isEmpty)
             Padding(
@@ -2944,39 +3020,51 @@ class _OrderEntryPageState extends State<OrderEntryPage> {
                   style: TextStyle(color: Colors.grey, fontSize: 14 * s)),
             )
           else
-            ..._menu.map((m) {
-              final qty = _qtyOf(m);
-              return Card(
-                margin: EdgeInsets.only(bottom: 6 * s),
-                child: ListTile(
-                  title: Text(m.name, style: TextStyle(fontSize: 17 * s, fontWeight: FontWeight.w600)),
-                  subtitle: Text('${fmt(m.price)} $_currency',
-                      style: TextStyle(fontSize: 13 * s, color: Colors.grey)),
-                  trailing: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      IconButton(
-                        iconSize: 26 * s,
-                        icon: const Icon(Icons.remove_circle_outline, color: Colors.orange),
-                        onPressed: qty > 0 ? () => _decrease(m) : null,
+            ReorderableListView.builder(
+              shrinkWrap: true,
+              physics: const NeverScrollableScrollPhysics(),
+              buildDefaultDragHandles: false, // 整行长按启动拖拽
+              itemCount: _menu.length,
+              onReorder: (o, n) => _reorderMenu(o, n),
+              itemBuilder: (context, index) {
+                final m = _menu[index];
+                final qty = _qtyOf(m);
+                return ReorderableDelayedDragStartListener(
+                  key: ObjectKey(m),
+                  index: index,
+                  child: Card(
+                    margin: EdgeInsets.only(bottom: 6 * s),
+                    child: ListTile(
+                      title: Text(m.name, style: TextStyle(fontSize: 17 * s, fontWeight: FontWeight.w600)),
+                      subtitle: Text('${fmt(m.price)} $_currency',
+                          style: TextStyle(fontSize: 13 * s, color: Colors.grey)),
+                      trailing: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          IconButton(
+                            iconSize: 26 * s,
+                            icon: const Icon(Icons.remove_circle_outline, color: Colors.orange),
+                            onPressed: qty > 0 ? () => _decrease(m) : null,
+                          ),
+                          SizedBox(
+                            width: 32 * s,
+                            child: Text('$qty',
+                                textAlign: TextAlign.center,
+                                style: TextStyle(fontSize: 17 * s, fontWeight: FontWeight.bold)),
+                          ),
+                          IconButton(
+                            iconSize: 26 * s,
+                            icon: const Icon(Icons.add_circle, color: Colors.green),
+                            onPressed: () => _increase(m),
+                          ),
+                        ],
                       ),
-                      SizedBox(
-                        width: 32 * s,
-                        child: Text('$qty',
-                            textAlign: TextAlign.center,
-                            style: TextStyle(fontSize: 17 * s, fontWeight: FontWeight.bold)),
-                      ),
-                      IconButton(
-                        iconSize: 26 * s,
-                        icon: const Icon(Icons.add_circle, color: Colors.green),
-                        onPressed: () => _increase(m),
-                      ),
-                    ],
+                      onTap: () => _editQtyDialog(m),
+                    ),
                   ),
-                  onTap: () => _editQtyDialog(m),
-                ),
-              );
-            }),
+                );
+              },
+            ),
           SizedBox(height: 16 * s),
 
           // 4. 已选菜品清单
@@ -3150,8 +3238,13 @@ class _OrderEntryPageState extends State<OrderEntryPage> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              Text('选择菜品（直接点击 + / - 加减）',
-                  style: TextStyle(fontSize: 16 * s, fontWeight: FontWeight.bold)),
+              Row(children: [
+                Expanded(
+                  child: Text('选择菜品（直接点击 + / - 加减）',
+                      style: TextStyle(fontSize: 16 * s, fontWeight: FontWeight.bold)),
+                ),
+                Text('长按可排序', style: TextStyle(fontSize: 13 * s, color: Colors.grey)),
+              ]),
               SizedBox(height: 10 * s),
               if (_menu.isEmpty)
                 Expanded(
@@ -3174,7 +3267,11 @@ class _OrderEntryPageState extends State<OrderEntryPage> {
                     itemBuilder: (context, index) {
                       final m = _menu[index];
                       final qty = _qtyOf(m);
-                      return _buildTabletMenuCard(m, qty);
+                      // 网格没法直接拖拽 → 长按弹出可拖动的排序列表
+                      return GestureDetector(
+                        onLongPress: _openMenuReorderDialog,
+                        child: _buildTabletMenuCard(m, qty),
+                      );
                     },
                   ),
                 ),
