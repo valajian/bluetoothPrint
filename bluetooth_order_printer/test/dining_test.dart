@@ -77,8 +77,14 @@ void main() {
       expect(o.diningPrefix, '(堂食)');
     });
 
-    test('打包 → 「打包」，桌号不参与打印', () {
+    test('打包 + 桌号 → 打包(Table:65)', () {
       final o = mkOrder('001', diningType: 'takeaway', tableNo: '65');
+      expect(o.diningLabel, '打包(Table:65)');
+      expect(o.diningPrefix, '(打包)');
+    });
+
+    test('打包未选桌号 → 只打印「打包」', () {
+      final o = mkOrder('001', diningType: 'takeaway', tableNo: '');
       expect(o.diningLabel, '打包');
       expect(o.diningPrefix, '(打包)');
     });
@@ -130,6 +136,12 @@ void main() {
       expect(text, isNot(contains('堂食')));
     });
 
+    test('打包 + 桌号：小票最顶部打印「打包(Table:65)」', () {
+      final chunks = buildEscPosBytesChunks(
+          mkOrder('002', diningType: 'takeaway', tableNo: '65'), mkSettings());
+      expect(chunkText(chunks.first), contains('打包(Table:65)'));
+    });
+
     test('旧订单：不打印用餐方式行', () {
       final chunks = buildEscPosBytesChunks(
           mkOrder('003', diningType: '', tableNo: ''), mkSettings());
@@ -157,6 +169,12 @@ void main() {
       final chunks = buildKitchenEscPosBytesChunks(
           mkOrder('006', diningType: 'takeaway', tableNo: ''), mkSettings());
       expect(chunksToText(chunks), contains('打包'));
+    });
+
+    test('打包 + 桌号：厨房单顶部也打印「打包(Table:12)」', () {
+      final chunks = buildKitchenEscPosBytesChunks(
+          mkOrder('006', diningType: 'takeaway', tableNo: '12'), mkSettings());
+      expect(chunksToText(chunks), contains('打包(Table:12)'));
     });
   });
 
@@ -254,7 +272,7 @@ void main() {
   });
 
   group('界面', () {
-    testWidgets('新建订单页：默认堂食且有桌号下拉，切到打包后下拉消失', (tester) async {
+    testWidgets('新建订单页：默认堂食，堂食与打包都有桌号下拉且默认不指定', (tester) async {
       SharedPreferences.setMockInitialValues({'table_nos': ['1', '65']});
       await tester.pumpWidget(const MaterialApp(home: OrderEntryPage()));
       await tester.pumpAndSettle();
@@ -265,11 +283,16 @@ void main() {
           find.widgetWithText(RadioListTile<String>, '打包'));
       expect(dineRadio.groupValue, 'dinein'); // 默认堂食
       expect(takeRadio.groupValue, 'dinein');
-      expect(find.byType(DropdownButtonFormField<String>), findsOneWidget);
 
+      // 堂食：有桌号下拉，默认不指定
+      expect(find.byType(DropdownButtonFormField<String>), findsOneWidget);
+      expect(find.text('不指定桌号'), findsOneWidget);
+
+      // 切到打包：桌号下拉仍在
       await tester.tap(find.widgetWithText(RadioListTile<String>, '打包'));
       await tester.pumpAndSettle();
-      expect(find.byType(DropdownButtonFormField<String>), findsNothing);
+      expect(find.byType(DropdownButtonFormField<String>), findsOneWidget);
+      expect(find.text('不指定桌号'), findsOneWidget);
     });
 
     testWidgets('窄屏手机（360dp）下用餐方式选择器不溢出', (tester) async {

@@ -104,16 +104,14 @@ class Order {
   bool get isDineIn => diningType == 'dinein';
   bool get isTakeaway => diningType == 'takeaway';
 
-  /// 用餐方式打印文字：
+  /// 用餐方式打印文字（堂食/打包都可以带桌号，未选桌号时只打用餐方式）：
   ///   堂食 + 桌号 → "堂食(Table:65)"；堂食未选桌号 → "堂食"
-  ///   打包        → "打包"
+  ///   打包 + 桌号 → "打包(Table:65)"；打包未选桌号 → "打包"
   ///   旧订单未标记 → 空串（不打印这一行）
   String get diningLabel {
-    if (isDineIn) {
-      final t = tableNo.trim();
-      return t.isEmpty ? '堂食' : '堂食(Table:$t)';
-    }
-    if (isTakeaway) return '打包';
+    final t = tableNo.trim();
+    if (isDineIn) return t.isEmpty ? '堂食' : '堂食(Table:$t)';
+    if (isTakeaway) return t.isEmpty ? '打包' : '打包(Table:$t)';
     return '';
   }
 
@@ -2491,8 +2489,9 @@ class _OrderEntryPageState extends State<OrderEntryPage> {
     }
   }
 
-  /// 用餐方式选择：堂食（默认）/ 打包；选堂食时多一个桌号下拉框。
-  /// 打印时会在小票最顶部输出 "堂食(Table:65)" / "打包"。
+  /// 用餐方式选择：堂食（默认）/ 打包；两种方式都可以选桌号，默认"不指定桌号"。
+  /// 打印时会在小票最顶部输出 "堂食(Table:65)" / "打包(Table:65)"，
+  /// 未选桌号时只输出 "堂食" / "打包"。
   Widget _buildDiningSelector(double s) {
     return Container(
       padding: EdgeInsets.all(12 * s),
@@ -2527,41 +2526,37 @@ class _OrderEntryPageState extends State<OrderEntryPage> {
                   visualDensity: VisualDensity.compact,
                   value: 'takeaway',
                   groupValue: _diningType,
-                  onChanged: (v) => setState(() {
-                    _diningType = v ?? 'dinein';
-                    // 打包单不保留桌号，避免打印出 "打包(Table:65)"
-                    if (_diningType != 'dinein') _tableNo = '';
-                  }),
+                  // 桌号两种方式都保留：切来切去不用重新选
+                  onChanged: (v) => setState(() => _diningType = v ?? 'dinein'),
                   title: Text('打包',
                       style: TextStyle(fontSize: 16 * s, fontWeight: FontWeight.bold)),
                 ),
               ),
             ],
           ),
-          if (_diningType == 'dinein') ...[
-            SizedBox(height: 4 * s),
-            if (_tableNos.isEmpty)
-              Text('暂无桌号，可先在【设置】→ 桌号管理里添加；不选桌号则只打印"堂食"',
-                  style: TextStyle(fontSize: 12 * s, color: Colors.grey))
-            else
-              DropdownButtonFormField<String>(
-                value: _tableNos.contains(_tableNo) ? _tableNo : '',
+          // 桌号：堂食 / 打包都显示，默认"不指定桌号"
+          SizedBox(height: 4 * s),
+          if (_tableNos.isEmpty)
+            Text('暂无桌号，可先在【设置】→ 桌号管理里添加；不选桌号则只打印用餐方式',
+                style: TextStyle(fontSize: 12 * s, color: Colors.grey))
+          else
+            DropdownButtonFormField<String>(
+              value: _tableNos.contains(_tableNo) ? _tableNo : '',
+              isDense: true,
+              decoration: InputDecoration(
+                labelText: '桌号',
                 isDense: true,
-                decoration: InputDecoration(
-                  labelText: '桌号',
-                  isDense: true,
-                  border: const OutlineInputBorder(),
-                  contentPadding:
-                      EdgeInsets.symmetric(horizontal: 10 * s, vertical: 10 * s),
-                ),
-                items: [
-                  const DropdownMenuItem(value: '', child: Text('不指定桌号')),
-                  for (final t in _tableNos)
-                    DropdownMenuItem(value: t, child: Text('$t 号桌')),
-                ],
-                onChanged: (v) => setState(() => _tableNo = v ?? ''),
+                border: const OutlineInputBorder(),
+                contentPadding:
+                    EdgeInsets.symmetric(horizontal: 10 * s, vertical: 10 * s),
               ),
-          ],
+              items: [
+                const DropdownMenuItem(value: '', child: Text('不指定桌号')),
+                for (final t in _tableNos)
+                  DropdownMenuItem(value: t, child: Text('$t 号桌')),
+              ],
+              onChanged: (v) => setState(() => _tableNo = v ?? ''),
+            ),
         ],
       ),
     );
@@ -2702,7 +2697,7 @@ class _OrderEntryPageState extends State<OrderEntryPage> {
       note: _noteCtrl.text.trim(),
       time: DateTime.now(),
       diningType: _diningType,
-      tableNo: _diningType == 'dinein' ? _tableNo : '',
+      tableNo: _tableNo,
     );
 
     // 保存历史
